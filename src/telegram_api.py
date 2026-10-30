@@ -32,6 +32,7 @@ def send_draft_to_admin(image_path, caption, post_id):
             "sendPhoto",
             chat_id=admin,
             caption=caption,
+            parse_mode="HTML",
             reply_markup=_json.dumps(keyboard),
             _files={"photo": f},
         )
@@ -42,7 +43,7 @@ def post_to_channel(image_path, caption):
     channel = env("CHANNEL_ID", required=True)
     with open(image_path, "rb") as f:
         return _call("sendPhoto", chat_id=channel, caption=caption,
-                     _files={"photo": f})
+                     parse_mode="HTML", _files={"photo": f})
 
 
 def send_sticker_to_channel(file_id):

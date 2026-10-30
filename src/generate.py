@@ -1,4 +1,5 @@
 """Draft yaratish: miya + media + adminga tasdiqqa yuborish."""
+import html
 import time
 from pathlib import Path
 
@@ -9,9 +10,13 @@ import telegram_api
 
 
 def build_caption(post, brand):
-    cta = f"\n\n👉 {brand['name']} — {brand['app_link']}"
+    # Caption matni (HTML uchun xavfsiz qilinadi)
+    body = html.escape(post["caption"].strip())
+    # Link so'z ortiga yashiriladi (chiroyli ko'rinish uchun)
+    link_text = html.escape(f"{brand['name']} — ilovani yuklab olish")
+    cta = f'\n\n👉 <a href="{brand["app_link"]}">{link_text}</a>'
     mention = f"\n{brand.get('channel_mention', '')}".rstrip()
-    return post["caption"].strip() + cta + mention
+    return body + cta + mention
 
 
 def run():

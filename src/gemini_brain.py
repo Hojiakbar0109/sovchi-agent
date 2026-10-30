@@ -44,6 +44,7 @@ Qoidalar:
 - "80 ta reaksiya bosing" kabi passiv so'rovlar YO'Q.
 - Foydalanuvchi sonini "{b['users_label']}" ko'rinishida yoz.
 - Caption 400-700 belgi. 1-3 ta mos emoji. Oxirida yengil CTA (ilovani ochish).
+- MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida, chiroyli tugma/so'z ko'rinishida qo'shiladi.
 
 Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa yozma:
 {{
