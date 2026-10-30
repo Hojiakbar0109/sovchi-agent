@@ -1,0 +1,32 @@
+name: Tasdiqni tekshirish va joylash
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # har 30 daqiqada
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Tasdiqlarni tekshirish
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python src/publish.py
+      - name: Holatni saqlash
+        run: |
+          git config user.name "sovchi-agent"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/
+          git commit -m "Holat yangilandi" || echo "O'zgarish yo'q"
+          git push || echo "Push qilinmadi"

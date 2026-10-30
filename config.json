@@ -1,0 +1,31 @@
+{
+  "brand": {
+    "name": "sovchi.app",
+    "tagline": "Jiddiy niyatdagilar uchun",
+    "language": "uzbek",
+    "users_label": "7k+",
+    "app_link": "https://play.google.com/store/apps/details?id=uz.sovchi.sovchiapp&pcampaignid=web_share",
+    "channel_mention": "@sovchi_app",
+    "colors": {
+      "primary": "#C50F13",
+      "background": "#FDF1DD",
+      "text_dark": "#1A1A1A",
+      "text_light": "#FDF1DD"
+    },
+    "logo_file": "assets/logo.png",
+    "voice": "Issiq, ishonchli, zamonaviy. Jiddiy munosabatlar haqida. Hech qachon followerlardan 'reaksiya bosing' deb so'ramaydi. 7k+ foydalanuvchi, Telegram bot va mobil ilova mavjud."
+  },
+  "posting": {
+    "posts_per_day": 2,
+    "timezone": "Asia/Tashkent",
+    "generate_times_utc": ["05:00", "12:00"]
+  },
+  "gemini": {
+    "text_model": "gemini-2.5-flash",
+    "image_model": "gemini-2.5-flash-image-preview",
+    "use_ai_image": false
+  },
+  "media": {
+    "stickers_enabled": true
+  }
+}

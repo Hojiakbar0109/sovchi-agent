@@ -1,0 +1,34 @@
+name: Draft yaratish
+
+on:
+  schedule:
+    - cron: "0 5 * * *"    # 10:00 Toshkent
+    - cron: "0 12 * * *"   # 17:00 Toshkent
+  workflow_dispatch:        # qo'lda ishga tushirish uchun
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Draft yaratish
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: python src/generate.py
+      - name: Natijani saqlash
+        run: |
+          git config user.name "sovchi-agent"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/
+          git commit -m "Yangi draft" || echo "O'zgarish yo'q"
+          git push || echo "Push qilinmadi"
