@@ -21,7 +21,7 @@
     "generate_times_utc": ["05:00", "12:00"]
   },
   "gemini": {
-    "text_model": "gemini-3.8-flash-lite",
+    "text_model": "gemini-3.8-flash",
     "image_model": "gemini-3.8-flash-image",
     "use_ai_image": false
   },
