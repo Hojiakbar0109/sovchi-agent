@@ -6,20 +6,30 @@ from google.api_core import exceptions as gexc
 from common import env, load_config, load_json, SAMPLES_FILE
 
 
+# Matn uchun bo'lmagan modellar (rasm, ovoz, embedding va h.k.) — chetlab o'tiladi
+_NON_TEXT = ("image", "tts", "audio", "speech", "embedding", "aqa", "vision",
+             "imagen", "veo", "live", "native-audio", "dialog")
+
+
 def _candidate_models():
-    """Sinab ko'riladigan modellar ro'yxati: avval config'dagi, keyin
-    mavjud modellardan (flash — avval, pro — oxirida). Shu tufayli model nomi
-    o'zgarsa yoki bittasining kunlik limiti tugasa, agent to'xtamaydi."""
+    """Sinab ko'riladigan MATN modellari: avval config'dagi, keyin mavjudlari
+    (flash → oldin, lite → keyin, pro → oxirida). Model nomi o'zgarsa yoki
+    bittasining kunlik limiti tugasa, agent boshqasiga o'tib ketadi."""
     cfg = load_config()
-    primary = cfg["gemini"]["text_model"]
-    order = [primary]
+    order = [cfg["gemini"]["text_model"]]
     try:
         available = []
         for m in genai.list_models():
-            if "generateContent" in getattr(m, "supported_generation_methods", []):
-                available.append(m.name.replace("models/", ""))
-        # flash-larni oldinга, pro-larni oxirga qo'yish
-        available.sort(key=lambda n: (("flash" not in n), ("pro" in n), n))
+            name = m.name.replace("models/", "")
+            if "generateContent" not in getattr(m, "supported_generation_methods", []):
+                continue
+            low = name.lower()
+            if any(bad in low for bad in _NON_TEXT):
+                continue
+            available.append(name)
+        available.sort(key=lambda n: (("flash" not in n.lower()),
+                                       ("lite" in n.lower()),
+                                       ("pro" in n.lower()), n))
         for n in available:
             if n not in order:
                 order.append(n)
@@ -29,19 +39,21 @@ def _candidate_models():
 
 
 def _complete(prompt):
-    """Modellarni navbatma-navbat sinab, birinchi ishlaganidan javob oladi."""
+    """Modellarni navbatma-navbat sinab, birinchi ishlaganidan javob oladi.
+    Har qanday xatoda keyingi modelga o'tadi (bittasi ishlamay qolsa to'xtamaydi)."""
     genai.configure(api_key=env("GEMINI_API_KEY", required=True))
     last_err = None
     for name in _candidate_models():
         try:
             resp = genai.GenerativeModel(name).generate_content(prompt)
-            print(f"Model ishlatildi: {name}")
-            return resp
-        except (gexc.NotFound, gexc.ResourceExhausted, gexc.PermissionDenied) as e:
+            if resp and getattr(resp, "text", None):
+                print(f"Model ishlatildi: {name}")
+                return resp
+            print(f"Model '{name}' bo'sh javob berdi, keyingisiga o'tyapman.")
+        except Exception as e:
             print(f"Model '{name}' ishlamadi ({type(e).__name__}), keyingisiga o'tyapman.")
             last_err = e
-            continue
-    raise last_err if last_err else RuntimeError("Hech qaysi model ishlamadi")
+    raise last_err if last_err else RuntimeError("Hech qaysi model javob bermadi")
 
 
 def _samples_block():
