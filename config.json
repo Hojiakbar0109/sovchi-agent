@@ -18,7 +18,10 @@
   "posting": {
     "posts_per_day": 2,
     "timezone": "Asia/Tashkent",
-    "generate_times_utc": ["05:00", "12:00"]
+    "generate_times_utc": [
+      "05:00",
+      "12:00"
+    ]
   },
   "gemini": {
     "text_model": "gemini-3.8-flash",
@@ -29,6 +32,61 @@
     "stickers_enabled": true,
     "sticker_chance": 0.5,
     "use_pixabay": true,
-    "video_chance": 0.4
+    "video_chance": 0.4,
+    "safe_queries": [
+      "wedding rings",
+      "henna hands",
+      "cozy home interior",
+      "two cups of tea",
+      "family together",
+      "parents and children",
+      "flowers bouquet",
+      "sunset nature",
+      "path in forest",
+      "open door light",
+      "old books",
+      "arabic calligraphy",
+      "mosque architecture",
+      "dates and tea",
+      "green park morning",
+      "white roses"
+    ],
+    "blocked_terms": [
+      "kiss",
+      "kissing",
+      "kisses",
+      "intimate",
+      "intimacy",
+      "romantic",
+      "romance",
+      "lingerie",
+      "bikini",
+      "swimsuit",
+      "underwear",
+      "bed",
+      "bedroom",
+      "nightclub",
+      "night club",
+      "party",
+      "dating",
+      "hug",
+      "hugging",
+      "embrace",
+      "embracing",
+      "cuddle",
+      "cuddling",
+      "sexy",
+      "sensual",
+      "seductive",
+      "passion",
+      "passionate",
+      "lovers",
+      "erotic",
+      "nude",
+      "naked",
+      "topless",
+      "valentine",
+      "honeymoon"
+    ]
   }
 }

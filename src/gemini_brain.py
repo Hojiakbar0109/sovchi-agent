@@ -84,7 +84,7 @@ def _json_format(b):
   "hook": "rasm ustiga chiqadigan qisqa sarlavha (max 60 belgi)",
   "caption": "to'liq post matni (emoji bilan)",
   "theme": "post mavzusi 1-2 so'zda",
-  "image_query": "stok rasm/video qidirish uchun 2-4 ta INGLIZCHA so'z (masalan: 'couple walking sunset', 'cozy cafe table', 'wedding rings flowers'). Post kayfiyatiga mos, estetik, matnsiz",
+  "image_query": "stok rasm/video qidirish uchun 2-4 ta INGLIZCHA so'z. FAQAT bosiq, oddiy, hurmatli, oilaviy mavzu (pastdagi RASM QOIDASIga qara)",
   "image_prompt": "AGAR AI rasm yaratilsa, ingliz tilida foto-realistik, premium, uslubdagi rasm uchun prompt (odamsiz yoki noaniq yuzli, matnsiz)"
 }}""".replace("{{", "{").replace("}}", "}")
 
@@ -98,6 +98,14 @@ OVOZ (uslub): {b['voice']}
 
 KANALNING ESKI POSTLARI (shulardan uslub, mavzu va ohangni o'rgan):
 {_samples_block()}"""
+
+
+def _image_rules():
+    safe = ", ".join(load_config().get("media", {}).get("safe_queries", []))
+    return ("RASM QOIDASI (image_query uchun): brend halol, oilaviy niyatli o'zbek/musulmon auditoriyaga mo'ljallangan. "
+            "Query bosiq, oddiy, hurmatli bo'lsin. Romantik/yaqinlik/sevishganlar (kiss, hug, romantic couple, "
+            "silhouette couple, intimate, dating, bed, bikini...) MUMKIN EMAS. Odamlar kerak bo'lsa — oila, ota-ona, "
+            "uzoqdagi bosiq juftlik. Afzal mavzular: " + safe + ". Shubhali bo'lsa shulardan birini tanla.")
 
 
 def _ask(task):

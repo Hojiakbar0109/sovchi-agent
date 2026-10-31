@@ -4,6 +4,7 @@ Asosiy kirish: make_media(post, base_path, allow_video) -> (yo'l, 'image'|'video
 None qaytsa, chaqiruvchi brend-kartochkaga (media.make_card) qaytadi.
 """
 import random
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -79,6 +80,47 @@ def _cover(img, w, h):
     return img.crop((left, top, left + w, top + h))
 
 
+def _media_cfg():
+    return load_config().get("media", {})
+
+
+def _blocked_re():
+    terms = _media_cfg().get("blocked_terms", [])
+    return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in terms) + r")\b", re.I) if terms else None
+
+
+_COUPLE_RISK = re.compile(r"\b(love|romance|silhouette|sunset|beach|together|embrace)\b", re.I)
+
+
+def _is_unsafe(text):
+    """Teg/so'rov oilaviy brend uchun noto'g'rimi (romantik, yaqinlik, ...)."""
+    rx = _blocked_re()
+    if rx and rx.search(text):
+        return True
+    return bool(re.search(r"\bcouple\b", text, re.I) and _COUPLE_RISK.search(text))
+
+
+def _clean(hits):
+    return [h for h in hits if not _is_unsafe(h.get("tags", ""))]
+
+
+def _queries(query):
+    """Avval Gemini so'rovi (xavfsiz bo'lsa), keyin neytral zaxira so'rovlar."""
+    safe = list(_media_cfg().get("safe_queries", []))
+    random.shuffle(safe)
+    return ([] if _is_unsafe(query) else [query]) + safe[:4]
+
+
+def _search(url, query, extra_sets):
+    """Birinchi xavfsiz natijalar to'plamini qaytaradi (bo'lmasa [])."""
+    for q in _queries(query):
+        for extra in extra_sets:
+            hits = _clean(_pixabay_get(url, q, extra))
+            if hits:
+                return hits
+    return []
+
+
 def _pixabay_get(url, query, extra):
     r = requests.get(url, params={"key": env("PIXABAY_API_KEY"), "q": query[:100],
                                   "safesearch": "true", "per_page": 30, **extra}, timeout=20)
@@ -122,7 +164,7 @@ def make_photo_post(query, hook, theme, out_path):
 def make_video_post(query, hook, theme, out_path):
     """Pixabay videosi (tiny/small, <45MB) + brend overlay, 9:16, ffmpeg bilan."""
     try:
-        hits = _pixabay_get(PIXABAY_VID, query, {}) or []
+        hits = _search(PIXABAY_VID, query, [{}])
         random.shuffle(hits)
         for hit in hits[:6]:
             v = next((hit["videos"][k] for k in ("small", "tiny")
