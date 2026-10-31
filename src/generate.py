@@ -58,6 +58,8 @@ def create_draft(post, note="", allow_video=False):
         "kind": kind,
         "file_id": file_id,
         "theme": post.get("theme", ""),
+        "pillar": post.get("pillar", ""),
+        "post_format": post.get("post_format", ""),
         "created": post_id,
         "admin_msg_id": admin_msg_id,
     })

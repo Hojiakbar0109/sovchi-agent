@@ -3,7 +3,7 @@ import json
 import google.generativeai as genai
 from google.api_core import exceptions as gexc
 
-from common import env, load_config, load_json, SAMPLES_FILE
+from common import ROOT, env, load_config, load_json, load_queue, SAMPLES_FILE
 
 
 # Matn uchun bo'lmagan modellar (rasm, ovoz, embedding va h.k.) — chetlab o'tiladi
@@ -67,37 +67,53 @@ def _samples_block():
     return "\n".join(lines)
 
 
-def _rules(b):
-    return f"""Qoidalar:
-- Faqat o'zbek tilida (lotin).
-- Qiziqarli, odamni ushlab turadigan "hook" bilan boshlansin.
-- Jiddiy munosabat, ishonch, tanishuv mavzusida qiymat bersin.
-- "80 ta reaksiya bosing" kabi passiv so'rovlar YO'Q.
-- Foydalanuvchi sonini "{b['users_label']}" ko'rinishida yoz.
-- Caption 400-700 belgi. 1-3 ta mos emoji. Oxirida yengil CTA (ilovani ochish).
-- MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida, chiroyli tugma/so'z ko'rinishida qo'shiladi."""
+def _playbook():
+    f = ROOT / "playbook.md"
+    return f.read_text(encoding="utf-8").strip() if f.exists() else ""
 
 
-def _json_format(b):
-    return """Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa yozma:
-{{
-  "hook": "rasm ustiga chiqadigan qisqa sarlavha (max 60 belgi)",
-  "caption": "to'liq post matni (emoji bilan)",
-  "theme": "post mavzusi 1-2 so'zda",
-  "image_query": "stok rasm/video qidirish uchun 2-4 ta INGLIZCHA so'z. FAQAT bosiq, oddiy, hurmatli, oilaviy mavzu (pastdagi RASM QOIDASIga qara)",
-  "image_prompt": "AGAR AI rasm yaratilsa, ingliz tilida foto-realistik, premium, uslubdagi rasm uchun prompt (odamsiz yoki noaniq yuzli, matnsiz)"
-}}""".replace("{{", "{").replace("}}", "}")
+def _history_block():
+    """Oxirgi postlar (ustun/format/hook) — takrorlanmaslik va ustunlarni almashtirish uchun."""
+    posts = load_queue().get("posts", [])[-14:]
+    if not posts:
+        return "(Hali tarix yo'q.)"
+    lines = []
+    for p in reversed(posts):
+        tag = "ADMIN RAD ETGAN" if p.get("status") == "rejected" else "chiqqan"
+        body = " ".join(str(p.get("caption", "")).split())[:140]
+        lines.append(f"- [{tag}] ustun={p.get('pillar', '?')} format={p.get('post_format', '?')} "
+                     f"mavzu={p.get('theme', '')} | {body}")
+    return "\n".join(lines)
+
+
+def _now_block():
+    from datetime import datetime, timedelta, timezone
+    d = datetime.now(timezone.utc) + timedelta(hours=5)  # Toshkent = UTC+5 (yozgi vaqt yo'q)
+    return f"Bugun (Toshkent): {d.strftime('%A, %d %B %Y')}."
 
 
 def _header(b):
-    return f"""Sen {b['name']} uchun professional SMM mutaxassisisan.
-Bu — o'zbek tilidagi jiddiy tanishuv / nikoh ilovasi. Shiori: "{b['tagline']}".
-{b['users_label']} foydalanuvchi, Telegram bot va mobil ilova mavjud.
+    return f"""{_playbook()}
 
+BREND: {b['name']} — o'zbek tilidagi jiddiy tanishuv / nikoh ilovasi. Shiori: "{b['tagline']}".
+{b['users_label']} foydalanuvchi, Telegram bot va mobil ilova mavjud.
 OVOZ (uslub): {b['voice']}
 
-KANALNING ESKI POSTLARI (shulardan uslub, mavzu va ohangni o'rgan):
-{_samples_block()}"""
+KANALNING ESKI POSTLARI (uslub va ohangni o'rgan):
+{_samples_block()}
+
+OXIRGI POSTLAR TARIXI (ustunlar va hooklarni TAKRORLAMA; "ADMIN RAD ETGAN" yo'nalishdan qoch):
+{_history_block()}
+
+{_now_block()} Mavsum, hafta kuni va yaqin bayramlarni o'rinli bo'lsagina hisobga ol."""
+
+
+def _rules(b):
+    return f"""Qoidalar:
+- Faqat o'zbek tilida (lotin).
+- Foydalanuvchi sonini "{b['users_label']}" ko'rinishida yoz (faqat o'rinli joyda).
+- Caption 500-850 belgi (QATIY 900 dan oshmasin). 1-3 ta emoji. Oxirida yengil, har safar boshqacha CTA.
+- MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida qo'shiladi."""
 
 
 def _image_rules():
@@ -108,11 +124,30 @@ def _image_rules():
             "uzoqdagi bosiq juftlik. Afzal mavzular: " + safe + ". Shubhali bo'lsa shulardan birini tanla.")
 
 
-def _ask(task):
-    """Umumiy so'rov: header + vazifa + qoidalar + JSON format."""
-    cfg = load_config()
-    b = cfg["brand"]
-    prompt = f"{_header(b)}\n\n{task}\n{_rules(b)}\n\n{_json_format(b)}"
+POST_JSON = """Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa yozma:
+{
+  "hook": "rasm ustiga chiqadigan sarlavha (max 60 belgi, hook formulalaridan biri, o'ziga xos)",
+  "caption": "to'liq post matni (emoji bilan, ko'z yugurtirib o'qiladigan)",
+  "theme": "post mavzusi 1-2 so'zda",
+  "pillar": "kontent ustuni nomi (ISHONCH, AMALIY MASLAHAT, MIF VA HAQIQAT, HIKOYA, SAVOL, ILOVA, QADRIYAT yoki MAVSUMIY)",
+  "post_format": "format (ro'yxat, mif/haqiqat, mini-hikoya, savol/tanlov, qo'llanma, ilova-imkoniyat, esse)",
+  "image_query": "stok rasm/video qidirish uchun 2-4 ta INGLIZCHA so'z (RASM QOIDASIga qara)",
+  "image_prompt": "AGAR AI rasm yaratilsa: ingliz tilida foto-realistik prompt (odamsiz yoki noaniq yuzli, matnsiz)"
+}"""
+
+PLAN_JSON = """Javobni FAQAT quyidagi JSON formatida ber:
+{
+  "pillar": "tanlangan ustun",
+  "post_format": "tanlangan format",
+  "audience_pain": "bu post qaysi aniq og'riq/savolga javob beradi (1 gap)",
+  "angle": "o'ziga xos burchak: nima yangilik/kutilmagan fikr beradi (1-2 gap)",
+  "hook_options": ["hook 1", "hook 2", "hook 3"],
+  "cta": "CTA turi (saqlab qo'y / do'stingga yubor / ilovani och / savolga javob yoz)",
+  "why": "nega aynan shu hozir (tarix va mavsumga ko'ra, 1 gap)"
+}"""
+
+
+def _json_call(prompt):
     resp = _complete(prompt)
     text = resp.text.strip()
     if text.startswith("```"):
@@ -122,30 +157,65 @@ def _ask(task):
     return json.loads(text.strip())
 
 
+def _trim_caption(post, limit=880):
+    """Telegram caption chegarasi (1024) — havola qo'shilgach sig'sin."""
+    cap = post.get("caption", "").strip()
+    if len(cap) > limit:
+        cut = cap[:limit]
+        end = max(cut.rfind(". "), cut.rfind("\n"), cut.rfind("! "), cut.rfind("? "))
+        cap = cut[:end + 1] if end > limit * 0.6 else cut.rstrip()
+    post["caption"] = cap
+    return post
+
+
+def _write(task, plan=None):
+    """2-bosqich: reja (bo'lsa) asosida postni yozadi, keyin 3-bosqich — muharrir tekshiruvi."""
+    b = load_config()["brand"]
+    plan_txt = ""
+    if plan:
+        plan_txt = ("\nSTRATEGIYA REJASI (shunga amal qil, hook_options ichidan eng kuchlisini tanla yoki yaxshila):\n"
+                    + json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
+    draft = _json_call(f"{_header(b)}\n\nVAZIFA: {task}\n{plan_txt}\n{_rules(b)}\n{_image_rules()}\n\n{POST_JSON}")
+    try:
+        review = (f"{_header(b)}\n\nVAZIFA: MUHARRIR. Quyidagi draftni SIFAT TEKSHIRUVI bo'yicha qattiq baho ber. "
+                  f"Hook kuchsiz yoki umumiy bo'lsa — almashtir. Bo'sh gaplarni olib tashla, qiymatni aniqlashtir, "
+                  f"keraksiz so'zlarni qisqartir. Soxta fakt, haqiqiy bo'lmagan va'da yoki romantik ohang bo'lsa — to'g'rila. "
+                  f"Draft yaxshi bo'lsa deyarli o'zgartirma.\n\nDRAFT:\n{json.dumps(draft, ensure_ascii=False)}\n\n"
+                  f"{_rules(b)}\n{_image_rules()}\n\n{POST_JSON}")
+        final = _json_call(review)
+        if final.get("hook") and final.get("caption"):
+            draft = final
+    except Exception as e:
+        print(f"Muharrir bosqichi o'tkazib yuborildi: {type(e).__name__}")
+    return _trim_caption(draft)
+
+
 def generate_post(extra=None):
-    """Yangi post yaratadi. extra — qo'shimcha mavzu/yo'nalish (ixtiyoriy)."""
-    task = "VAZIFA: shu uslubda, kanalga yangi BITTA post yoz."
-    if extra:
-        task += f"\nQo'shimcha yo'nalish: {extra}"
-    return _ask(task)
+    """3 bosqich: strategiya -> yozish -> muharrir. extra — admin yo'nalishi (ixtiyoriy)."""
+    b = load_config()["brand"]
+    direction = f"\nADMIN YO'NALISHI (hisobga ol): {extra}" if extra else ""
+    plan = None
+    try:
+        plan = _json_call(f"{_header(b)}\n\nVAZIFA: STRATEGIYA. Tarixga qarab keyingi post uchun eng yaxshi "
+                          f"rejani tuz: ustunni (oxirgilardan FARQLI), formatni, auditoriya og'rig'ini va "
+                          f"o'ziga xos burchakni tanla.{direction}\n\n{PLAN_JSON}")
+        print(f"Reja: {plan.get('pillar')} / {plan.get('post_format')} — {plan.get('angle')}")
+    except Exception as e:
+        print(f"Strategiya bosqichi o'tkazib yuborildi: {type(e).__name__}")
+    return _write("shu uslubda, kanalga yangi BITTA kuchli post yoz." + direction, plan)
 
 
 def revise_post(current_caption, comment):
     """Mavjud postni admin izohi asosida qayta yozadi."""
-    task = (f"VAZIFA: quyidagi MAVJUD postni admin izohi asosida QAYTA yoz.\n\n"
-            f"--- MAVJUD POST ---\n{current_caption}\n--- TUGADI ---\n\n"
-            f"ADMIN IZOHI (shunga amal qil): {comment}\n\n"
-            f"Izohga mos ravishda postni yaxshila, lekin brend uslubini saqla.")
-    return _ask(task)
+    return _write(f"quyidagi MAVJUD postni admin izohi asosida QAYTA yoz.\n\n--- MAVJUD POST ---\n"
+                  f"{current_caption}\n--- TUGADI ---\n\nADMIN IZOHI (shunga amal qil): {comment}\n\n"
+                  f"Izohga mos ravishda yaxshila, lekin brend uslubi va playbook qoidalarini saqla.")
 
 
 def adapt_post(source_text):
-    """Boshqa kanaldan olingan postni sovchi.app brendi va uslubiga moslaydi."""
-    task = (f"VAZIFA: quyidagi BOSHQA kanaldagi postdan G'OYA olib, uni butunlay "
-            f"sovchi.app uchun qaytadan yoz. Matnni ko'chirma — faqat g'oya/mavzuni "
-            f"ol va o'z uslubimizda, o'z brendimiz uchun yangi post qil.\n\n"
-            f"--- MANBA POST ---\n{source_text}\n--- TUGADI ---")
-    return _ask(task)
+    """Boshqa kanaldan olingan postdan g'oya olib, sovchi.app uchun yangidan yozadi."""
+    return _write(f"quyidagi BOSHQA kanaldagi postdan faqat G'OYA/mavzuni ol va butunlay sovchi.app uchun, "
+                  f"o'z uslubimizda qaytadan yoz (ko'chirma qilma).\n\n--- MANBA POST ---\n{source_text}\n--- TUGADI ---")
 
 
 if __name__ == "__main__":
