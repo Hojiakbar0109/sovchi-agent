@@ -17,7 +17,7 @@ def _call(method, **params):
     return data["result"]
 
 
-def send_draft_to_admin(image_path, caption, post_id, note=""):
+def send_draft_to_admin(image_path, caption, post_id, note="", kind="image"):
     """Rasm + matnni adminga ✅/❌ tugmalari bilan yuboradi.
     note bo'lsa, caption tepasiga qo'shiladi (masalan: qayta yozilgani)."""
     admin = env("ADMIN_CHAT_ID", required=True)
@@ -29,14 +29,17 @@ def send_draft_to_admin(image_path, caption, post_id, note=""):
     }
     import json as _json
     full = (note + "\n\n" + caption) if note else caption
+    field, method = ("video", "sendVideo") if kind == "video" else ("photo", "sendPhoto")
+    extra = {"supports_streaming": "true", "width": 1080, "height": 1920} if kind == "video" else {}
     with open(image_path, "rb") as f:
         return _call(
-            "sendPhoto",
+            method,
             chat_id=admin,
             caption=full,
             parse_mode="HTML",
             reply_markup=_json.dumps(keyboard),
-            _files={"photo": f},
+            _files={field: f},
+            **extra,
         )
 
 
@@ -56,9 +59,12 @@ def send_message(chat_id, text, reply_to=None, reply_markup=None):
         return None
 
 
-def post_to_channel(image_path, caption):
-    """Tasdiqlangan postni kanalga joylaydi."""
+def post_to_channel(image_path, caption, kind="image", file_id=None):
+    """Tasdiqlangan postni kanalga joylaydi. Video — file_id orqali (fayl repoda saqlanmaydi)."""
     channel = env("CHANNEL_ID", required=True)
+    if kind == "video":
+        return _call("sendVideo", chat_id=channel, video=file_id, caption=caption,
+                     parse_mode="HTML", supports_streaming="true")
     with open(image_path, "rb") as f:
         return _call("sendPhoto", chat_id=channel, caption=caption,
                      parse_mode="HTML", _files={"photo": f})

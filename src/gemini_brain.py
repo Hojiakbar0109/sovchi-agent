@@ -84,6 +84,7 @@ def _json_format(b):
   "hook": "rasm ustiga chiqadigan qisqa sarlavha (max 60 belgi)",
   "caption": "to'liq post matni (emoji bilan)",
   "theme": "post mavzusi 1-2 so'zda",
+  "image_query": "stok rasm/video qidirish uchun 2-4 ta INGLIZCHA so'z (masalan: 'couple walking sunset', 'cozy cafe table', 'wedding rings flowers'). Post kayfiyatiga mos, estetik, matnsiz",
   "image_prompt": "AGAR AI rasm yaratilsa, ingliz tilida foto-realistik, premium, uslubdagi rasm uchun prompt (odamsiz yoki noaniq yuzli, matnsiz)"
 }}""".replace("{{", "{").replace("}}", "}")
 

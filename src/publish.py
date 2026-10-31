@@ -172,7 +172,9 @@ def _handle_callback(cq, q, cfg):
         return
     img = ROOT / post["image"]
     if action == "approve":
-        if img.exists():
+        if post.get("kind") == "video" and post.get("file_id"):
+            telegram_api.post_to_channel("", post["caption"], kind="video", file_id=post["file_id"])
+        elif img.exists():
             telegram_api.post_to_channel(str(img), post["caption"])
             # Ixtiyoriy: postdan keyin stiker (kutubxona bo'lsa)
             media_cfg = cfg.get("media", {})

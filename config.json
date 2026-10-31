@@ -5,7 +5,7 @@
     "language": "uzbek",
     "users_label": "7k+",
     "app_link": "https://play.google.com/store/apps/details?id=uz.sovchi.sovchiapp&pcampaignid=web_share",
-    "channel_mention": "@sovchi_app",
+    "channel_mention": "@sovchiapp",
     "colors": {
       "primary": "#C50F13",
       "background": "#FDF1DD",
@@ -27,6 +27,8 @@
   },
   "media": {
     "stickers_enabled": true,
-    "sticker_chance": 0.5
+    "sticker_chance": 0.5,
+    "use_pixabay": true,
+    "video_chance": 0.4
   }
 }
