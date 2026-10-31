@@ -1,7 +1,6 @@
 """Draft yaratish: miya + media + adminga tasdiqqa yuborish."""
 import html
 import time
-from pathlib import Path
 
 from common import load_config, load_queue, save_queue, PENDING
 import gemini_brain
@@ -19,13 +18,11 @@ def build_caption(post, brand):
     return body + cta + mention
 
 
-def run():
+def create_draft(post, note=""):
+    """Post lug'atidan rasm yasab, adminга tasdiqqa yuboradi va navbatga qo'shadi.
+    post: {hook, caption, theme, image_prompt}. note: adminga qo'shimcha izoh."""
     cfg = load_config()
     brand = cfg["brand"]
-
-    print("Miya ishlayapti (Gemini)...")
-    post = gemini_brain.generate_post()
-    print(f"Mavzu: {post['theme']} | Hook: {post['hook']}")
 
     post_id = str(int(time.time()))
     img_path = PENDING / f"{post_id}.png"
@@ -39,7 +36,8 @@ def run():
 
     caption = build_caption(post, brand)
 
-    telegram_api.send_draft_to_admin(str(img_path), caption, post_id)
+    res = telegram_api.send_draft_to_admin(str(img_path), caption, post_id, note=note)
+    admin_msg_id = res.get("message_id") if isinstance(res, dict) else None
     print("Draft adminga yuborildi ✓")
 
     q = load_queue()
@@ -48,11 +46,20 @@ def run():
         "status": "pending",
         "caption": caption,
         "image": f"data/pending/{post_id}.png",
-        "theme": post["theme"],
+        "theme": post.get("theme", ""),
         "created": post_id,
+        "admin_msg_id": admin_msg_id,
     })
     save_queue(q)
     print("Navbatga qo'shildi (status: pending)")
+    return post_id
+
+
+def run(extra=None):
+    print("Miya ishlayapti (Gemini)...")
+    post = gemini_brain.generate_post(extra=extra)
+    print(f"Mavzu: {post['theme']} | Hook: {post['hook']}")
+    create_draft(post)
 
 
 if __name__ == "__main__":

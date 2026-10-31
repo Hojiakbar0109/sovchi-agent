@@ -10,6 +10,7 @@ QUEUE_FILE = DATA / "queue.json"
 OFFSET_FILE = DATA / "offset.txt"
 SAMPLES_FILE = DATA / "samples.json"      # eski postlardan o'rganilgan uslub namunalari
 STICKERS_FILE = DATA / "stickers.json"    # botga forward qilingan stiker file_id'lari
+INBOX_FILE = DATA / "inbox.json"          # forward qilingan post (namuna/moslash tanlovigacha)
 
 DATA.mkdir(exist_ok=True)
 PENDING.mkdir(exist_ok=True)

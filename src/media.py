@@ -105,6 +105,14 @@ def make_card(hook, theme, out_path):
     return out_path
 
 
+def pick_sticker():
+    """Kutubxonadan tasodifiy stiker file_id qaytaradi (bo'lmasa None)."""
+    import random
+    from common import load_json, STICKERS_FILE
+    stickers = load_json(STICKERS_FILE, {"stickers": []}).get("stickers", [])
+    return random.choice(stickers) if stickers else None
+
+
 def make_ai_image(image_prompt, out_path):
     """Gemini orqali AI rasm (ixtiyoriy). Xato bo'lsa None qaytaradi."""
     try:

@@ -67,47 +67,76 @@ def _samples_block():
     return "\n".join(lines)
 
 
-def generate_post():
-    """Bugungi post uchun matn va rasm g'oyasini qaytaradi."""
-    cfg = load_config()
-    b = cfg["brand"]
-
-    prompt = f"""Sen {b['name']} uchun professional SMM mutaxassisisan.
-Bu — o'zbek tilidagi jiddiy tanishuv / nikoh ilovasi. Shiori: "{b['tagline']}".
-{b['users_label']} foydalanuvchi, Telegram bot va mobil ilova mavjud.
-
-OVOZ (uslub): {b['voice']}
-
-KANALNING ESKI POSTLARI (shulardan uslub, mavzu va ohangni o'rgan):
-{_samples_block()}
-
-VAZIFA: shu uslubda, kanalga yangi BITTA post yoz.
-Qoidalar:
+def _rules(b):
+    return f"""Qoidalar:
 - Faqat o'zbek tilida (lotin).
 - Qiziqarli, odamni ushlab turadigan "hook" bilan boshlansin.
 - Jiddiy munosabat, ishonch, tanishuv mavzusida qiymat bersin.
 - "80 ta reaksiya bosing" kabi passiv so'rovlar YO'Q.
 - Foydalanuvchi sonini "{b['users_label']}" ko'rinishida yoz.
 - Caption 400-700 belgi. 1-3 ta mos emoji. Oxirida yengil CTA (ilovani ochish).
-- MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida, chiroyli tugma/so'z ko'rinishida qo'shiladi.
+- MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida, chiroyli tugma/so'z ko'rinishida qo'shiladi."""
 
-Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa yozma:
+
+def _json_format(b):
+    return """Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa yozma:
 {{
   "hook": "rasm ustiga chiqadigan qisqa sarlavha (max 60 belgi)",
   "caption": "to'liq post matni (emoji bilan)",
   "theme": "post mavzusi 1-2 so'zda",
-  "image_prompt": "AGAR AI rasm yaratilsa, ingliz tilida foto-realistik, premium, {b['name']} uslubidagi rasm uchun prompt (odamsiz yoki noaniq yuzli, matnsiz)"
-}}"""
+  "image_prompt": "AGAR AI rasm yaratilsa, ingliz tilida foto-realistik, premium, uslubdagi rasm uchun prompt (odamsiz yoki noaniq yuzli, matnsiz)"
+}}""".replace("{{", "{").replace("}}", "}")
 
+
+def _header(b):
+    return f"""Sen {b['name']} uchun professional SMM mutaxassisisan.
+Bu — o'zbek tilidagi jiddiy tanishuv / nikoh ilovasi. Shiori: "{b['tagline']}".
+{b['users_label']} foydalanuvchi, Telegram bot va mobil ilova mavjud.
+
+OVOZ (uslub): {b['voice']}
+
+KANALNING ESKI POSTLARI (shulardan uslub, mavzu va ohangni o'rgan):
+{_samples_block()}"""
+
+
+def _ask(task):
+    """Umumiy so'rov: header + vazifa + qoidalar + JSON format."""
+    cfg = load_config()
+    b = cfg["brand"]
+    prompt = f"{_header(b)}\n\n{task}\n{_rules(b)}\n\n{_json_format(b)}"
     resp = _complete(prompt)
     text = resp.text.strip()
-    # JSON ni tozalash (``` bo'lsa)
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
-    data = json.loads(text.strip())
-    return data
+    return json.loads(text.strip())
+
+
+def generate_post(extra=None):
+    """Yangi post yaratadi. extra — qo'shimcha mavzu/yo'nalish (ixtiyoriy)."""
+    task = "VAZIFA: shu uslubda, kanalga yangi BITTA post yoz."
+    if extra:
+        task += f"\nQo'shimcha yo'nalish: {extra}"
+    return _ask(task)
+
+
+def revise_post(current_caption, comment):
+    """Mavjud postni admin izohi asosida qayta yozadi."""
+    task = (f"VAZIFA: quyidagi MAVJUD postni admin izohi asosida QAYTA yoz.\n\n"
+            f"--- MAVJUD POST ---\n{current_caption}\n--- TUGADI ---\n\n"
+            f"ADMIN IZOHI (shunga amal qil): {comment}\n\n"
+            f"Izohga mos ravishda postni yaxshila, lekin brend uslubini saqla.")
+    return _ask(task)
+
+
+def adapt_post(source_text):
+    """Boshqa kanaldan olingan postni sovchi.app brendi va uslubiga moslaydi."""
+    task = (f"VAZIFA: quyidagi BOSHQA kanaldagi postdan G'OYA olib, uni butunlay "
+            f"sovchi.app uchun qaytadan yoz. Matnni ko'chirma — faqat g'oya/mavzuni "
+            f"ol va o'z uslubimizda, o'z brendimiz uchun yangi post qil.\n\n"
+            f"--- MANBA POST ---\n{source_text}\n--- TUGADI ---")
+    return _ask(task)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@
     "use_ai_image": false
   },
   "media": {
-    "stickers_enabled": true
+    "stickers_enabled": true,
+    "sticker_chance": 0.5
   }
 }
