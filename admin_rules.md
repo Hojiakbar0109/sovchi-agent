@@ -1,0 +1,1 @@
+- Postda foydalanuvchilar sonini (7k+ va shunga o'xshash) yozma.

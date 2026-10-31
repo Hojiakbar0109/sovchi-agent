@@ -1,5 +1,6 @@
 """Agentning miyasi: Gemini orqali content plan va post matni (caption)."""
 import json
+import re
 import google.generativeai as genai
 from google.api_core import exceptions as gexc
 
@@ -92,11 +93,19 @@ def _now_block():
     return f"Bugun (Toshkent): {d.strftime('%A, %d %B %Y')}."
 
 
+def _admin_rules():
+    f = ROOT / "admin_rules.md"
+    t = f.read_text(encoding="utf-8").strip() if f.exists() else ""
+    return ("DOIMIY ADMIN QOIDALARI (har postda QATIY bajar, playbookdan ham ustun):\n" + t) if t else ""
+
+
 def _header(b):
     return f"""{_playbook()}
 
+{_admin_rules()}
+
 BREND: {b['name']} — o'zbek tilidagi jiddiy tanishuv / nikoh ilovasi. Shiori: "{b['tagline']}".
-{b['users_label']} foydalanuvchi, Telegram bot va mobil ilova mavjud.
+Telegram bot va mobil ilova mavjud.
 OVOZ (uslub): {b['voice']}
 
 KANALNING ESKI POSTLARI (uslub va ohangni o'rgan):
@@ -111,7 +120,7 @@ OXIRGI POSTLAR TARIXI (ustunlar va hooklarni TAKRORLAMA; "ADMIN RAD ETGAN" yo'na
 def _rules(b):
     return f"""Qoidalar:
 - Faqat o'zbek tilida (lotin).
-- Foydalanuvchi sonini "{b['users_label']}" ko'rinishida yoz (faqat o'rinli joyda).
+- Foydalanuvchilar soni ("{b['users_label']}", "ming foydalanuvchi" va h.k.) haqida postda UMUMAN yozma, agar admin aniq so'ramasa.
 - Caption 500-850 belgi (QATIY 900 dan oshmasin). 1-3 ta emoji. Oxirida yengil, har safar boshqacha CTA.
 - MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida qo'shiladi."""
 
@@ -168,26 +177,48 @@ def _trim_caption(post, limit=880):
     return post
 
 
-def _write(task, plan=None):
+def _note_block(note):
+    if not note:
+        return ""
+    return ("\nADMIN IZOHI — ENG YUQORI USTUVORLIK. Playbook va qoidalardan ham ustun, so'zma-so'z bajar, "
+            f"aksini qilma:\n\"{note}\"\n")
+
+
+_USERS_RE = re.compile(r"[^.!?\n]*(?:\b\d+\s*k\s*\+|\b\d+\s*ming\b)[^.!?\n]*[.!?]?\s*", re.I)
+
+
+def _strip_user_count(post, note):
+    """Admin so'ramasa, foydalanuvchilar soni haqidagi gaplarni olib tashlaydi."""
+    if note and re.search(r"7k|ming|foydalanuvchi", note, re.I):
+        return post
+    post["caption"] = re.sub(r"[ 	]{2,}", " ", _USERS_RE.sub(" ", post.get("caption", ""))).strip()
+    if re.search(r"\d+\s*k\s*\+", post.get("hook", ""), re.I):
+        post["hook"] = re.sub(r"\s*\d+\s*k\s*\+\s*", " ", post["hook"]).strip()
+    return post
+
+
+def _write(task, plan=None, note=None):
     """2-bosqich: reja (bo'lsa) asosida postni yozadi, keyin 3-bosqich — muharrir tekshiruvi."""
     b = load_config()["brand"]
     plan_txt = ""
     if plan:
         plan_txt = ("\nSTRATEGIYA REJASI (shunga amal qil, hook_options ichidan eng kuchlisini tanla yoki yaxshila):\n"
                     + json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
-    draft = _json_call(f"{_header(b)}\n\nVAZIFA: {task}\n{plan_txt}\n{_rules(b)}\n{_image_rules()}\n\n{POST_JSON}")
+    nb = _note_block(note)
+    draft = _json_call(f"{_header(b)}\n\nVAZIFA: {task}\n{nb}{plan_txt}\n{_rules(b)}\n{_image_rules()}\n\n{POST_JSON}")
     try:
         review = (f"{_header(b)}\n\nVAZIFA: MUHARRIR. Quyidagi draftni SIFAT TEKSHIRUVI bo'yicha qattiq baho ber. "
                   f"Hook kuchsiz yoki umumiy bo'lsa — almashtir. Bo'sh gaplarni olib tashla, qiymatni aniqlashtir, "
                   f"keraksiz so'zlarni qisqartir. Soxta fakt, haqiqiy bo'lmagan va'da yoki romantik ohang bo'lsa — to'g'rila. "
-                  f"Draft yaxshi bo'lsa deyarli o'zgartirma.\n\nDRAFT:\n{json.dumps(draft, ensure_ascii=False)}\n\n"
+                  f"Draft yaxshi bo'lsa deyarli o'zgartirma. ADMIN IZOHI bo'lsa, draft unga to'liq amal qilganini "
+                  f"tekshir va uni BUZMA.\n{nb}\nDRAFT:\n{json.dumps(draft, ensure_ascii=False)}\n\n"
                   f"{_rules(b)}\n{_image_rules()}\n\n{POST_JSON}")
         final = _json_call(review)
         if final.get("hook") and final.get("caption"):
             draft = final
     except Exception as e:
         print(f"Muharrir bosqichi o'tkazib yuborildi: {type(e).__name__}")
-    return _trim_caption(draft)
+    return _trim_caption(_strip_user_count(draft, note))
 
 
 def generate_post(extra=None):
@@ -206,10 +237,10 @@ def generate_post(extra=None):
 
 
 def revise_post(current_caption, comment):
-    """Mavjud postni admin izohi asosida qayta yozadi."""
-    return _write(f"quyidagi MAVJUD postni admin izohi asosida QAYTA yoz.\n\n--- MAVJUD POST ---\n"
-                  f"{current_caption}\n--- TUGADI ---\n\nADMIN IZOHI (shunga amal qil): {comment}\n\n"
-                  f"Izohga mos ravishda yaxshila, lekin brend uslubi va playbook qoidalarini saqla.")
+    """Mavjud postni admin izohi asosida qayta yozadi (izoh — eng yuqori ustuvorlik)."""
+    return _write("quyidagi MAVJUD postni admin izohi asosida QAYTA yoz.\n\n--- MAVJUD POST ---\n"
+                  f"{current_caption}\n--- TUGADI ---\n\nAvval admin izohini bajar; qolgan joyini "
+                  "brend uslubi va playbookka mos saqla.", note=comment)
 
 
 def adapt_post(source_text):
