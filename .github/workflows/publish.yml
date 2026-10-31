@@ -1,8 +1,6 @@
 name: Tasdiqni tekshirish va joylash
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"   # har 30 daqiqada
   workflow_dispatch:
 
 permissions:
