@@ -19,6 +19,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Tasdiqlarni tekshirish
         env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
