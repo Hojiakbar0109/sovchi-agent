@@ -122,6 +122,7 @@ const NON_TEXT = ["image", "tts", "audio", "speech", "embedding", "aqa", "vision
   "imagen", "veo", "live", "native-audio", "dialog"];
 
 let modelCache: string[] | null = null;
+let lastModelUsed = "";
 async function candidateModels() {
   if (modelCache) return modelCache;
   const order = [GEMINI_MODEL];
@@ -187,6 +188,8 @@ async function gemini(prompt: string, o: GOpts = {}): Promise<any> {
       try {
         const out = await askModel(model, prompt, timeout);
         console.log(`Model ishlatildi: ${model} (urinish ${attempt})`);
+        if (modelCache && modelCache[0] !== model) modelCache = [model, ...modelCache.filter((m) => m !== model)];
+        lastModelUsed = model;
         return out;
       } catch (e: any) {
         lastErr = e;
@@ -531,7 +534,7 @@ async function classifyNote(p: { hook?: string | null; caption: string }, note: 
         `- "text": faqat MATN haqida (qisqartir, ohang, so'z, fakt, CTA).\n- "both": ikkalasi yoki aniq emas.\n\n` +
         `DRAFT HOOK: ${p.hook ?? ""}\nDRAFT MATN: ${p.caption.replace(/<[^>]+>/g, "").slice(0, 500)}\nIZOH: ${note}\n\n` +
         `JSON: {"scope":"text|image|both","image_query":"scope image yoki both bo'lsa: yangi rasm uchun 2-4 INGLIZCHA so'z (bosiq, oilaviy, romantik emas), aks holda bo'sh"}`,
-      { timeout: 12_000, budget: 20_000, attempts: 2, models: 2 },
+      { timeout: 12_000, budget: 20_000, attempts: 1, models: 5 },
     );
     const scope = ["text", "image", "both"].includes(r?.scope) ? r.scope : "both";
     const q = cut(r?.image_query, 80);
@@ -1099,7 +1102,7 @@ ${previous}
 JSON:
 {"summary":"oy strategiyasi 1-2 gapda","items":[{"date":"YYYY-MM-DD","slot_time":"HH:MM","post_type":"text_image|question|carousel|poll|video_text","pillar":"...","theme":"...","core_message":"...","hook_idea":"...","cta":"..."}]}`;
 
-      const raw = await gemini(prompt, { timeout: 80_000, budget: 100_000, attempts: 1, models: 2 });
+      const raw = await gemini(prompt, { timeout: 80_000, budget: 100_000, attempts: 1, models: 5 });
       const allowed = new Set(chunk);
       const valid = (Array.isArray(raw?.items) ? raw.items : []).filter((it: any) =>
         allowed.has(String(it?.date)) && POST_TYPES.includes(it.post_type) &&
@@ -1488,6 +1491,17 @@ Deno.serve(async (req) => {
       out.chat = { id: c.id, type: c.type, title: c.title, username: c.username };
     } catch (e) {
       out.chat_error = String(e);
+    }
+    if (url.searchParams.get("probe") === "1") {
+      try {
+        const models = await candidateModels();
+        out.gemini_configured = GEMINI_MODEL;
+        out.gemini_candidates = models.slice(0, 8);
+        await gemini('JSON: {"ok":true}', { timeout: 20_000, budget: 50_000, attempts: 1, models: 8 });
+        out.gemini_working = lastModelUsed;
+      } catch (e) {
+        out.gemini_error = String(e);
+      }
     }
     return Response.json(out);
   }
