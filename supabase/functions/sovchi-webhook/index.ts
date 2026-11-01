@@ -120,6 +120,7 @@ const NON_TEXT = ["image", "tts", "audio", "speech", "embedding", "aqa", "vision
 
 let modelCache: string[] | null = null;
 let lastModelUsed = "";
+let failedLog: string[] = []; // "model: error" per failed call, shown by ?check&probe=1
 let failedAttempts = 0; // Gemini calls that errored (404 etc.); exposed by ?check&probe=1
 async function candidateModels() {
   if (modelCache) return modelCache;
@@ -198,6 +199,7 @@ async function gemini(prompt: string, o: GOpts = {}): Promise<any> {
       } catch (e: any) {
         lastErr = e;
         failedAttempts++;
+        failedLog.push(`${model}: ${String(e).slice(0, 80)}`);
         console.warn(`Model '${model}' urinish ${attempt}/${attempts}: ${e}`);
         if (e?.status && e.status < 500 && e.status !== 429) break;
         if (attempt < attempts) await sleep(attempt * 1000);
@@ -1740,9 +1742,11 @@ Deno.serve(async (req) => {
         out.gemini_configured = GEMINI_MODEL;
         out.gemini_candidates = models.slice(0, 8);
         failedAttempts = 0;
+        failedLog = [];
         await gemini('JSON: {"ok":true}', { timeout: 20_000, budget: 50_000, attempts: 1, models: 8 });
         out.gemini_working = lastModelUsed;
         out.gemini_failed_attempts = failedAttempts; // 0 = first model answered, no 404 retries
+        out.gemini_failures = failedLog;
       } catch (e) {
         out.gemini_error = String(e);
       }
