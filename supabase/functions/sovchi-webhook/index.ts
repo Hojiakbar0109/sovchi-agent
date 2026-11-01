@@ -1099,7 +1099,7 @@ ${previous}
 JSON:
 {"summary":"oy strategiyasi 1-2 gapda","items":[{"date":"YYYY-MM-DD","slot_time":"HH:MM","post_type":"text_image|question|carousel|poll|video_text","pillar":"...","theme":"...","core_message":"...","hook_idea":"...","cta":"..."}]}`;
 
-      const raw = await gemini(prompt, { timeout: 45_000, budget: 60_000, attempts: 2, models: 2 });
+      const raw = await gemini(prompt, { timeout: 80_000, budget: 100_000, attempts: 1, models: 2 });
       const allowed = new Set(chunk);
       const valid = (Array.isArray(raw?.items) ? raw.items : []).filter((it: any) =>
         allowed.has(String(it?.date)) && POST_TYPES.includes(it.post_type) &&
@@ -1126,6 +1126,7 @@ JSON:
   await Promise.all(chunks.map((c, i) => runChunk(c, i)));
 
   if (total < 5) {
+    await db.from("sv_plan").update({ summary: `FAILED: ${failed.join(" | ")}`.slice(0, 1500) }).eq("month", month);
     return void await say(
       `⚠️ ${month} rejasi to'liq tuzilmadi: atigi ${total} band.\n${esc(failed.join("\n"))}\nQayta urinish: ?generate_plan=...&force=1`,
     );
