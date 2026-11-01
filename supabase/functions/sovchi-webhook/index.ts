@@ -110,11 +110,6 @@ const coupleRe = /(?<![a-z])couple(?![a-z])/i;
 const coupleRiskRe = /(?<![a-z])(love|romance|silhouette|sunset|beach|together|embrace)(?![a-z])/i;
 const isUnsafe = (t: string) => blockedRe.test(t) || (coupleRe.test(t) && coupleRiskRe.test(t));
 
-function queryList(q: string) {
-  const safe = [...SAFE_QUERIES].sort(() => Math.random() - 0.5).slice(0, 4);
-  return (isUnsafe(q) ? [] : [q]).concat(safe);
-}
-
 // ---------- Gemini ----------
 const GEMINI_API = "https://generativelanguage.googleapis.com/v1beta";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -221,6 +216,7 @@ type Post = {
   pillar?: string;
   post_format?: string;
   image_query?: string;
+  image_queries?: string[];
   sticker_emoji?: string;
   slides?: Slide[];
   poll?: PollData;
@@ -322,7 +318,7 @@ const POST_JSON = `Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa 
   "theme": "post mavzusi 1-2 so'zda",
   "pillar": "kontent ustuni nomi (ISHONCH, AMALIY MASLAHAT, MIF VA HAQIQAT, HIKOYA, SAVOL, ILOVA, QADRIYAT yoki MAVSUMIY)",
   "post_format": "format (ro'yxat, mif/haqiqat, mini-hikoya, savol/tanlov, qo'llanma, ilova-imkoniyat, esse)",
-  "image_query": "stok-foto qidirish uchun 2-4 ta INGLIZCHA so'z (RASM QOIDASIga qara)",
+  "image_queries": ["3 ta INGLIZCHA stok-foto qidiruvi, har biri 2-5 so'z: 1) postning ASOSIY fikrini ko'rsatadigan ANIQ sahna yoki narsa, 2) unga yaqin umumiyroq variant, 3) xavfsiz zaxira (RASM QOIDASIga qara)"],
   "sticker_emoji": "post kayfiyatiga mos stiker topish uchun 1-3 ta emoji, faqat emojilar (masalan: '❤️', '💍', '🤝', '😊', '🤔', '🌹')"
 }`;
 
@@ -368,7 +364,7 @@ const RULES = `Qoidalar:
 - Followerlardan "reaksiya bosing / like bosing" deb HECH QACHON so'rama.
 - MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida qo'shiladi.
 
-RASM QOIDASI (image_query uchun): brend halol, oilaviy niyatli o'zbek/musulmon auditoriyaga mo'ljallangan. Query bosiq, oddiy, hurmatli bo'lsin. Romantik/yaqinlik/sevishganlar (kiss, hug, romantic couple, silhouette couple, intimate, dating, bed, bikini...) MUMKIN EMAS. Odamlar kerak bo'lsa — oila, ota-ona, uzoqdagi bosiq juftlik. Afzal mavzular: ${SAFE_QUERIES.join(", ")}. Shubhali bo'lsa shulardan birini tanla.`;
+RASM QOIDASI (image_queries uchun): rasm POST MA'NOSINI ko'rsatsin — mavhum emas, ANIQ narsa yoki sahna (masalan "javobsiz xabar" -> "woman looking at phone", "oila bilan tanishuv" -> "family tea table", "ishonch" -> "two hands handshake", "to'y tayyorgarligi" -> "wedding table flowers"). Qidiruv inglizcha, 2-5 so'z, rasmda nima ko'rinishini tasvirla. Brend halol, oilaviy niyatli o'zbek/musulmon auditoriyaga mo'ljallangan: romantik/yaqinlik/sevishganlar (kiss, hug, romantic couple, silhouette couple, intimate, dating, bed, bikini...) MUMKIN EMAS; odamlar kerak bo'lsa — oila, ota-ona, yolg'iz inson, qo'llar, uzoqdagi bosiq juftlik. Faqat mavzuga mos aniq narsa topilmasa zaxira uchun: ${SAFE_QUERIES.join(", ")}.`;
 
 const TYPE_BRIEF: Record<string, string> = {
   text_image: "Format: oddiy matn + rasm post.",
@@ -444,9 +440,14 @@ function normalize(type: PostType, raw: any): Post {
     };
   }
   if (!raw?.hook || !raw?.caption) throw new Error("hook/caption yo'q");
+  const qs = [...new Set<string>(
+    [...(Array.isArray(raw.image_queries) ? raw.image_queries : []), raw.image_query]
+      .map((q) => cut(q, 80)).filter((q: string) => q && !isUnsafe(q)),
+  )].slice(0, 4);
   return {
     post_type: type, hook: String(raw.hook), caption: String(raw.caption), theme: cut(raw.theme, 40),
-    pillar: raw.pillar, post_format: raw.post_format, image_query: raw.image_query, sticker_emoji: raw.sticker_emoji,
+    pillar: raw.pillar, post_format: raw.post_format, image_query: qs[0], image_queries: qs,
+    sticker_emoji: raw.sticker_emoji,
   };
 }
 
@@ -545,7 +546,7 @@ async function classifyNote(p: { hook?: string | null; caption: string }, note: 
   }
 }
 
-// ---------- Stock photos (Pixabay first, Pexels as backup) ----------
+// ---------- Photos: concrete queries -> candidates -> Gemini picks the one that matches the text ----------
 const PIXABAY_KEY = env("PIXABAY_API_KEY");
 const PEXELS_KEY = env("PEXELS_API_KEY");
 
@@ -555,49 +556,133 @@ async function fetchBytes(url: string) {
   return new Uint8Array(await r.arrayBuffer());
 }
 
-async function pixabayPhoto(query: string): Promise<Uint8Array | null> {
-  for (const q of queryList(query)) {
+type PhotoState = { queries: string[]; qi: number; used: string[] };
+type Cand = { id: string; tags: string; url: string; score: number };
+
+const tokens = (s: string) => s.toLowerCase().split(/[^a-z]+/).filter((w) => w.length >= 3);
+
+// Pixabay (tags) + Pexels (alt text); best tag overlap with the query first, random among equals.
+async function searchCandidates(query: string, used: Set<string>): Promise<Cand[]> {
+  const toks = tokens(query);
+  const score = (t: string) => toks.reduce((s, w) => s + (t.toLowerCase().includes(w) ? 1 : 0), 0);
+  const out: Cand[] = [];
+  const seen = new Set<string>();
+  const add = (id: string, tags: string, url: string) => {
+    if (!url || seen.has(id) || used.has(id) || isUnsafe(tags)) return;
+    seen.add(id);
+    out.push({ id, tags, url, score: score(tags) });
+  };
+  if (PIXABAY_KEY) {
     for (const orientation of ["vertical", "all"]) {
-      const r = await fetch(
-        `https://pixabay.com/api/?key=${PIXABAY_KEY}&q=${encodeURIComponent(q.slice(0, 100))}&image_type=photo&orientation=${orientation}&safesearch=true&per_page=30`,
-        { signal: AbortSignal.timeout(10_000) },
-      );
-      const hits = ((await r.json()).hits ?? []).filter((h: any) => !isUnsafe(String(h.tags ?? "")));
-      if (!hits.length) continue;
-      const h = hits[Math.floor(Math.random() * Math.min(hits.length, 20))];
-      return await fetchBytes(h.webformatURL);
+      try {
+        const r = await fetch(
+          `https://pixabay.com/api/?key=${PIXABAY_KEY}&q=${encodeURIComponent(query.slice(0, 100))}&image_type=photo&orientation=${orientation}&safesearch=true&per_page=30`,
+          { signal: AbortSignal.timeout(10_000) },
+        );
+        for (const h of (await r.json()).hits ?? []) add(`pixabay:${h.id}`, String(h.tags ?? ""), h.webformatURL);
+      } catch (e) {
+        console.warn("pixabay search failed:", e);
+      }
+      if (out.length >= 8) break;
     }
   }
-  return null;
-}
-
-async function pexelsPhoto(query: string): Promise<Uint8Array | null> {
-  for (const q of queryList(query)) {
-    const r = await fetch(
-      `https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&orientation=portrait&per_page=15`,
-      { headers: { Authorization: PEXELS_KEY }, signal: AbortSignal.timeout(10_000) },
-    );
-    const photos = ((await r.json()).photos ?? []).filter((p: any) => !isUnsafe(String(p.alt ?? "")));
-    if (!photos.length) continue;
-    const p = photos[Math.floor(Math.random() * photos.length)];
-    return await fetchBytes(p.src.portrait);
-  }
-  return null;
-}
-
-async function pickPhoto(query?: string | null): Promise<Uint8Array | null> {
-  if (!query) return null;
-  const sources = [PIXABAY_KEY ? pixabayPhoto : null, PEXELS_KEY ? pexelsPhoto : null]
-    .filter(Boolean) as ((q: string) => Promise<Uint8Array | null>)[];
-  for (const src of sources) {
+  if (PEXELS_KEY && out.length < 8) {
     try {
-      const p = await src(query);
-      if (p) return p;
+      const r = await fetch(
+        `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&orientation=portrait&per_page=15`,
+        { headers: { Authorization: PEXELS_KEY }, signal: AbortSignal.timeout(10_000) },
+      );
+      for (const p of (await r.json()).photos ?? []) add(`pexels:${p.id}`, String(p.alt ?? ""), p.src?.portrait);
     } catch (e) {
-      console.warn("pickPhoto failed:", e);
+      console.warn("pexels search failed:", e);
     }
   }
-  return null;
+  return out.sort((a, b) => b.score - a.score || Math.random() - 0.5);
+}
+
+function b64(bytes: Uint8Array) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// Gemini looks at the candidates: index of the best match for the post's meaning, -1 when none is suitable.
+async function chooseByVision(images: Uint8Array[], hook: string, caption: string): Promise<number> {
+  const parts: unknown[] = [{
+    text: `Telegram post uchun rasm tanlayapsan.\nPOST SARLAVHASI: ${hook}\nPOST MATNI: ${caption.slice(0, 600)}\n\n` +
+      `Quyidagi nomzod rasmlardan postning MA'NOSINI eng yaxshi ko'rsatadiganini tanla (mavzuga aloqador aniq narsa/sahna). ` +
+      `Brend halol, oilaviy niyatli musulmon auditoriya uchun: romantik/yaqin, sevishganlar, ochiq kiyim, ichkilik, tungi klub bo'lsa YAROQSIZ. ` +
+      `Hech biri mos kelmasa yoki hammasi yaroqsiz bo'lsa -1. Javob FAQAT JSON: {"best": <rasm raqami yoki -1>}`,
+  }];
+  images.forEach((img, i) => {
+    parts.push({ text: `Rasm ${i}:` });
+    parts.push({ inline_data: { mime_type: "image/jpeg", data: b64(img) } });
+  });
+  let lastErr: unknown = null;
+  for (const model of (await candidateModels()).slice(0, 4)) {
+    try {
+      const r = await fetch(`${GEMINI_API}/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_KEY },
+        body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: "application/json" } }),
+        signal: AbortSignal.timeout(25_000),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        lastErr = new Error(`HTTP ${r.status}`);
+        continue;
+      }
+      const text = String(data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "").replace(/```(?:json)?/g, "").trim();
+      const best = Number(JSON.parse(text)?.best);
+      return Number.isInteger(best) && best >= -1 && best < images.length ? best : 0;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  console.warn("vision choice failed, using top candidate:", lastErr);
+  return 0;
+}
+
+// 3 concrete English stock-photo searches for a post (specific -> general -> safe fallback).
+async function makeImageQueries(hook: string, caption: string): Promise<string[]> {
+  try {
+    const r = await gemini(
+      `Telegram post uchun stok-foto qidiruvlari tuz.\nSARLAVHA: ${hook}\nMATN: ${caption.slice(0, 500)}\n\n` +
+        `3 ta INGLIZCHA qidiruv (har biri 2-5 so'z): 1) postning asosiy fikrini ko'rsatadigan ANIQ sahna yoki narsa, 2) unga yaqin umumiyroq variant, 3) xavfsiz zaxira. ` +
+        `Mavhum so'zlar emas, rasmda nima ko'rinishini yoz. Romantik/yaqinlik (kiss, hug, romantic couple, intimate, dating, bed...) mumkin emas; odamlar kerak bo'lsa oila, qo'llar, yolg'iz inson.\n` +
+        `JSON: {"queries":["...","...","..."]}`,
+      { timeout: 15_000, budget: 25_000, attempts: 1, models: 5 },
+    );
+    const qs = (Array.isArray(r?.queries) ? r.queries : []).map((q: unknown) => cut(q, 80)).filter((q: string) => q && !isUnsafe(q));
+    if (qs.length) return [...new Set<string>(qs)].slice(0, 4);
+  } catch (e) {
+    console.warn("makeImageQueries failed:", e);
+  }
+  return [SAFE_QUERIES[Math.floor(Math.random() * SAFE_QUERIES.length)]];
+}
+
+// One photo that fits the text. Tries up to 3 queries starting at st.qi; never repeats a used photo.
+async function findPhoto(hook: string, caption: string, st: PhotoState): Promise<{ bytes: Uint8Array | null; state: PhotoState }> {
+  if (!PIXABAY_KEY && !PEXELS_KEY) return { bytes: null, state: st };
+  const used = new Set(st.used);
+  const n = st.queries.length;
+  for (let a = 0; a < Math.min(3, n); a++) {
+    const qi = (st.qi + a) % n;
+    const cands = (await searchCandidates(st.queries[qi], used)).slice(0, 4);
+    if (!cands.length) continue;
+    const got = (await Promise.allSettled(cands.map((c) => fetchBytes(c.url))))
+      .map((r, i) => (r.status === "fulfilled" ? { c: cands[i], bytes: r.value } : null))
+      .filter(Boolean) as { c: Cand; bytes: Uint8Array }[];
+    if (!got.length) continue;
+    const idx = got.length > 1 ? await chooseByVision(got.map((g) => g.bytes), hook, caption) : 0;
+    if (idx < 0) {
+      got.forEach((g) => used.add(g.c.id)); // rejected: do not offer these again
+      continue;
+    }
+    used.add(got[idx].c.id);
+    return { bytes: got[idx].bytes, state: { queries: st.queries, qi, used: [...used].slice(-40) } };
+  }
+  return { bytes: null, state: { ...st, used: [...used].slice(-40) } };
 }
 
 // ---------- Stickers ----------
@@ -652,10 +737,27 @@ const pollText = (p: PollData) =>
   `📊 <b>${esc(p.question)}</b>\n` + p.options.map((o, i) => `${p.is_quiz && p.correct_option_id === i ? "✅" : "▫️"} ${i + 1}. ${esc(o)}`).join("\n") +
   (p.is_quiz ? `\n\n<i>Viktorina${p.explanation ? ": " + esc(p.explanation) : ""}</i>` : "");
 
-// Photo card (stock photo when found, brand card otherwise) with a fresh random layout.
-async function renderPostImage(post: { hook: string; theme: string; image_query?: string | null }, prevLayout?: string | null) {
-  const photo = await pickPhoto(post.image_query);
-  return await renderCard({ hook: post.hook, theme: post.theme, photo, layout: randomLayout(prevLayout) });
+// Photo card: a photo that matches the text (Gemini picks among candidates), fresh random layout.
+// `rotate` = next search query ("Boshqa rasm"); `query` = admin-supplied search to try first.
+async function renderPostImage(
+  post: { hook: string; theme: string; caption: string; image_query?: string | null; image_queries?: string[]; media?: any },
+  prevLayout?: string | null,
+  opts: { rotate?: boolean; query?: string | null } = {},
+) {
+  const plain = String(post.caption ?? "").replace(/<[^>]+>/g, "");
+  let st: PhotoState = post.media?.queries?.length
+    ? { queries: post.media.queries, qi: post.media.qi ?? 0, used: post.media.used ?? [] }
+    : { queries: [], qi: 0, used: [] };
+  if (!st.queries.length) {
+    const own = [...(post.image_queries ?? []), ...(post.image_query ? [post.image_query] : [])];
+    const base = [...new Set(own)];
+    st.queries = base.length >= 2 ? base : [...new Set([...base, ...(await makeImageQueries(post.hook, plain))])];
+  }
+  if (opts.query) st = { ...st, queries: [opts.query, ...st.queries.filter((q) => q !== opts.query)].slice(0, 5), qi: 0 };
+  else if (opts.rotate) st = { ...st, qi: (st.qi + 1) % st.queries.length };
+  const found = await findPhoto(post.hook, plain, st);
+  const image = await renderCard({ hook: post.hook, theme: post.theme, photo: found.bytes, layout: randomLayout(prevLayout) });
+  return { ...image, state: found.state };
 }
 
 // Carousel slides: typographic cards from the same renderer, with slide numbers.
@@ -709,6 +811,7 @@ async function sendDraft(post: Post, ctx: { plan_item_id?: number | null } = {})
   } else {
     const image = await renderPostImage(post);
     const caption = buildCaption(post.caption);
+    base.image_query = image.state.queries[image.state.qi] ?? base.image_query;
     const form = new FormData();
     form.set("chat_id", ADMIN);
     form.set("caption", caption);
@@ -717,7 +820,7 @@ async function sendDraft(post: Post, ctx: { plan_item_id?: number | null } = {})
     form.set("reply_markup", JSON.stringify(draftKeyboard(id, post.post_type)));
     const sent = await tg("sendPhoto", form);
     await db.from("sv_posts").insert({
-      ...base, caption, layout: image.layout,
+      ...base, caption, layout: image.layout, media: image.state,
       photo_file_id: sent.photo[sent.photo.length - 1].file_id, admin_message_id: sent.message_id,
     });
   }
@@ -746,7 +849,6 @@ async function markDraft(p: any, label: string) {
 
 // Swap only the picture: same text, new photo and a freshly shuffled template.
 async function swapImage(p: any, query?: string | null) {
-  const q = query || p.image_query;
   if (p.post_type === "carousel" && p.media?.slides) {
     const slides: Slide[] = p.media.slides;
     const cards = await renderSlides(slides, p.theme ?? "", p.layout);
@@ -757,7 +859,11 @@ async function swapImage(p: any, query?: string | null) {
     }).eq("id", p.id);
     return void await say("🔄 Karusel slaydlari qayta yasaldi (yuqoridagi yangi rasmlar). Tugmalar eski xabarda.");
   }
-  const image = await renderPostImage({ hook: p.hook ?? "", theme: p.theme ?? "", image_query: q }, p.layout);
+  const image = await renderPostImage(
+    { hook: p.hook ?? "", theme: p.theme ?? "", caption: p.caption ?? "", image_query: p.image_query, media: p.media },
+    p.layout,
+    query ? { query } : { rotate: true },
+  );
   const form = new FormData();
   form.set("chat_id", ADMIN);
   form.set("message_id", String(p.admin_message_id));
@@ -766,7 +872,8 @@ async function swapImage(p: any, query?: string | null) {
   form.set("reply_markup", JSON.stringify(draftKeyboard(p.id, p.post_type)));
   const edited = await tg("editMessageMedia", form);
   await db.from("sv_posts").update({
-    photo_file_id: edited.photo[edited.photo.length - 1].file_id, layout: image.layout, image_query: q ?? null,
+    photo_file_id: edited.photo[edited.photo.length - 1].file_id, layout: image.layout,
+    image_query: image.state.queries[image.state.qi] ?? p.image_query ?? null, media: image.state,
   }).eq("id", p.id);
 }
 
@@ -777,7 +884,7 @@ async function onImg(cq: any, id: string) {
     return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Bu turda rasm yo'q" });
   }
   await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Yangi rasm qidiryapman 🔄" });
-  if (data.post_type !== "carousel" && (!PIXABAY_KEY && !PEXELS_KEY || !data.image_query)) {
+  if (data.post_type !== "carousel" && (!PIXABAY_KEY && !PEXELS_KEY)) {
     return void await say("⚠️ Rasm manbasi sozlanmagan (PIXABAY_API_KEY yo'q yoki bu draft eski).");
   }
   await swapImage(data);
