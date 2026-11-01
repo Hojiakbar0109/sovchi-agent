@@ -1041,7 +1041,8 @@ async function sendPlanView(month: string, intro: string) {
   await db.from("sv_plan").update({ admin_message_id: sent.message_id }).eq("month", month);
 }
 
-// Gemini builds the whole month; `comment`+`previous` re-plan after the admin's remark.
+// Gemini builds the month in weekly chunks (one big call outlives the edge runtime and dies silently).
+// Each chunk is saved as soon as it arrives, so a partial plan survives; `comment` re-plans after the admin's remark.
 async function generatePlan(month: string, opts: { comment?: string; force?: boolean } = {}) {
   const { data: existing } = await db.from("sv_plan").select("*").eq("month", month).maybeSingle();
   if (existing?.status === "active" && !opts.force) {
@@ -1052,55 +1053,86 @@ async function generatePlan(month: string, opts: { comment?: string; force?: boo
   const days: string[] = [];
   for (let d = 1; d <= new Date(Date.UTC(y, mo, 0)).getUTCDate(); d++) {
     const iso = `${month}-${String(d).padStart(2, "0")}`;
-    if (iso >= today) days.push(`${iso} ${wdOf(iso)}`);
+    if (iso >= today) days.push(iso);
   }
   if (!days.length) return void await say(`⚠️ ${month} oyida rejalanadigan kun qolmagan.`);
 
+  await say(`⏳ <b>${month}</b> oylik reja tuzilyapti, 1-2 daqiqa...`);
+
+  // the previous plan is the context for an admin remark; read it BEFORE it is cleared
   let previous = "";
   if (opts.comment) {
-    const { data: prev } = await db.from("sv_plan_items").select("post_date, slot_time, post_type, pillar, theme, core_message, hook_idea, cta")
+    const { data: prev } = await db.from("sv_plan_items")
+      .select("post_date, slot_time, post_type, pillar, theme, core_message, hook_idea, cta")
       .eq("month", month).eq("status", "planned").order("post_date");
     previous = `\nAVVALGI REJA (admin shuni o'zgartirishni so'radi):\n${JSON.stringify(prev)}\n\nADMIN IZOHI — ENG YUQORI USTUVORLIK, rejani shunga moslab QAYTA tuz:\n"${opts.comment}"\n`;
   }
 
-  const prompt = `${await header()}
+  await db.from("sv_plan").upsert({ month, status: "pending", summary: "", approved_at: null });
+  await db.from("sv_plan_items").delete().eq("month", month).eq("status", "planned");
 
-VAZIFA: OYLIK KONTENT-REJA. ${month} oyi uchun sovchi.app Telegram kanali taqvimini tuz.
-Quyidagi kunlar uchun (hafta kuni bilan):
-${days.join(", ")}
+  const head = await header(); // db lookups once, shared by every chunk
+  const chunks: string[][] = [];
+  for (let i = 0; i < days.length; i += 7) chunks.push(days.slice(i, i + 7));
+
+  let total = 0;
+  let summary = "";
+  const failed: string[] = [];
+
+  const runChunk = async (chunk: string[], idx: number) => {
+    const label = `${idx + 1}-bo'lak (${shortDate(chunk[0])}–${shortDate(chunk[chunk.length - 1])})`;
+    try {
+      const prompt = `${head}
+
+VAZIFA: OYLIK KONTENT-REJANING BIR BO'LAGI. ${month} oyi uchun sovchi.app Telegram kanali taqvimi: ${idx + 1}/${chunks.length}-bo'lak (hafta).
+Faqat shu kunlar uchun (hafta kuni bilan): ${chunk.map((d) => `${d} ${wdOf(d)}`).join(", ")}
 
 TALABLAR:
-- Odatda kuniga 1 post (haftasiga 5-7), ba'zi kunlar 2 post bo'lishi mumkin, ba'zi kunlar bo'sh qolishi mumkin.
-- Turlar: text_image (asosiy), question (ochiq savol), carousel (3-5 slayd), poll (so'rovnoma), video_text (qisqa brendli video). Oyga taxminan: 4 video_text, 4-5 carousel, 3-4 poll, 4-5 question, qolgani text_image.
-- Ustunlarni (ISHONCH, AMALIY MASLAHAT, MIF VA HAQIQAT, HIKOYA, SAVOL, ILOVA, QADRIYAT, MAVSUMIY) aralashtir; ketma-ket bir xil ustun/turni qo'yma. METRIKADAGI g'oliblarga og'ish.
+- Odatda kuniga 1 post (shu bo'lakda ${Math.max(4, chunk.length - 1)}-${chunk.length + 1} band), ba'zi kunlar bo'sh qolishi yoki 2 post bo'lishi mumkin.
+- Turlar: text_image (asosiy), question (ochiq savol), carousel (3-5 slayd), poll (so'rovnoma), video_text (qisqa brendli video). Shu bo'lakda taxminan: 1 video_text, 1 carousel, 1 poll, 1 question, qolgani text_image.
+- Ustunlarni (ISHONCH, AMALIY MASLAHAT, MIF VA HAQIQAT, HIKOYA, SAVOL, ILOVA, QADRIYAT, MAVSUMIY) aralashtir; ketma-ket bir xil ustun/turni qo'yma. METRIKADAGI g'oliblarga og'ish. Boshqa haftalar ham alohida tuziladi, shuning uchun mavzularni o'ziga xos tanla (umumiy "ishonch haqida" emas).
 - O'zbekiston mavsumiyligi va bayramlarini hisobga ol (to'y mavsumi, ob-havo, bayramlar, hafta kuni: juma — alohida ohang) — faqat aniq bilganingni yoz.
 - slot_time: ${PLAN_SLOTS.join(" / ")} dan biri (METRIKADAGI eng kuchli soatga og'ish).
 - Har band MAJBURIY maydonlari: date (YYYY-MM-DD), slot_time, post_type, pillar, theme, core_message (post MATNI aynan nima deydi / qaysi burchak — 1-2 aniq gap, eng muhim maydon), hook_idea, cta.
 - Foydalanuvchilar sonini hech qayerda tilga olma. Followerlardan reaksiya so'rama.
 ${previous}
 JSON:
-{"summary":"oy strategiyasi 2-3 gapda","items":[{"date":"YYYY-MM-DD","slot_time":"HH:MM","post_type":"text_image|question|carousel|poll|video_text","pillar":"...","theme":"...","core_message":"...","hook_idea":"...","cta":"..."}]}`;
+{"summary":"oy strategiyasi 1-2 gapda","items":[{"date":"YYYY-MM-DD","slot_time":"HH:MM","post_type":"text_image|question|carousel|poll|video_text","pillar":"...","theme":"...","core_message":"...","hook_idea":"...","cta":"..."}]}`;
 
-  const raw = await gemini(prompt, { timeout: 110_000, budget: 130_000, attempts: 2, models: 2 });
-  const valid = (Array.isArray(raw?.items) ? raw.items : []).filter((it: any) =>
-    /^\d{4}-\d{2}-\d{2}$/.test(String(it?.date)) && String(it.date).startsWith(month) && String(it.date) >= today &&
-    POST_TYPES.includes(it.post_type) && it.pillar && it.theme && it.core_message && it.hook_idea && it.cta
-  );
-  if (valid.length < 5) throw new Error(`Gemini yaroqli reja bermadi (${valid.length} band)`);
+      const raw = await gemini(prompt, { timeout: 45_000, budget: 60_000, attempts: 2, models: 2 });
+      const allowed = new Set(chunk);
+      const valid = (Array.isArray(raw?.items) ? raw.items : []).filter((it: any) =>
+        allowed.has(String(it?.date)) && POST_TYPES.includes(it.post_type) &&
+        it.pillar && it.theme && it.core_message && it.hook_idea && it.cta
+      );
+      if (!valid.length) throw new Error("yaroqli band yo'q");
+      const rows = valid.map((it: any) => ({
+        month, post_date: it.date,
+        slot_time: /^\d{2}:\d{2}$/.test(String(it.slot_time)) ? it.slot_time : "14:00",
+        post_type: it.post_type, pillar: cut(it.pillar, 40), theme: cut(it.theme, 80),
+        core_message: cut(it.core_message, 400), hook_idea: cut(it.hook_idea, 160), cta: cut(it.cta, 120),
+      }));
+      const { error } = await db.from("sv_plan_items").insert(rows); // saved immediately
+      if (error) throw error;
+      total += rows.length;
+      if (!summary && raw?.summary) summary = String(raw.summary).slice(0, 1500);
+    } catch (e) {
+      console.warn(`plan chunk ${label} failed:`, e);
+      failed.push(`${label}: ${String(e).slice(0, 120)}`);
+    }
+  };
 
-  await db.from("sv_plan").upsert({
-    month, status: "pending", summary: String(raw?.summary ?? "").slice(0, 1500), approved_at: null,
-  });
-  await db.from("sv_plan_items").delete().eq("month", month).eq("status", "planned");
-  const rows = valid.map((it: any) => ({
-    month, post_date: it.date,
-    slot_time: PLAN_SLOTS.includes(String(it.slot_time)) ? it.slot_time : (/^\d{2}:\d{2}$/.test(String(it.slot_time)) ? it.slot_time : "14:00"),
-    post_type: it.post_type, pillar: cut(it.pillar, 40), theme: cut(it.theme, 80),
-    core_message: cut(it.core_message, 400), hook_idea: cut(it.hook_idea, 160), cta: cut(it.cta, 120),
-  }));
-  const { error } = await db.from("sv_plan_items").insert(rows);
-  if (error) throw error;
-  await sendPlanView(month, `🗓 <b>${month} oyi uchun kontent-reja tayyor</b> (${rows.length} band)\n\n${esc(String(raw?.summary ?? ""))}`);
+  // chunks are independent: run them side by side so the whole plan fits the runtime limit
+  await Promise.all(chunks.map((c, i) => runChunk(c, i)));
+
+  if (total < 5) {
+    return void await say(
+      `⚠️ ${month} rejasi to'liq tuzilmadi: atigi ${total} band.\n${esc(failed.join("\n"))}\nQayta urinish: ?generate_plan=...&force=1`,
+    );
+  }
+  await db.from("sv_plan").update({ summary }).eq("month", month);
+  const note = failed.length ? `\n\n⚠️ ${failed.length} ta bo'lak yasalmadi:\n${esc(failed.join("\n"))}` : "";
+  await sendPlanView(month, `🗓 <b>${month} oyi uchun kontent-reja tayyor</b> (${total} band)\n\n${esc(summary)}${note}`);
 }
 
 async function onPlanOk(cq: any, month: string) {
