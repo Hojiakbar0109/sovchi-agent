@@ -20,8 +20,9 @@ const CHANNEL = env("CHANNEL_ID");
 const GEMINI_KEY = env("GEMINI_API_KEY");
 const GEMINI_MODEL = env("GEMINI_MODEL") || "gemini-3.8-flash";
 const WEBHOOK_SECRET = env("WEBHOOK_SECRET");
-// share of published posts that get a sticker right after them (0..1)
-const STICKER_CHANCE = Number(env("STICKER_CHANCE") || "0.8");
+// Every published post gets a mood-matching sticker (35%: a second one). STICKER_CHANCE=0 switches stickers off.
+const STICKERS_OFF = env("STICKER_CHANCE") === "0";
+const SECOND_STICKER_CHANCE = 0.35;
 
 const db = createClient(env("SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"));
 
@@ -311,10 +312,23 @@ const nowBlock = () =>
     }).format(new Date())
   }.`;
 
+// A different look for each post: structure and light markup (**bold**, "> " quote, "- " bullets) vary.
+const STYLES = [
+  "QISQA QATORLAR: har gap alohida qatorda, qatorlar orasida bo'sh qator; 1-2 ta kalit so'zni **qalin** qil.",
+  "RO'YXAT: bitta kirish gapi, keyin 3-5 ta punkt (har biri '- ' bilan boshlanadi), oxirida bitta qisqa xulosa.",
+  "SAVOL-JAVOB: 2-3 juft; savol qatori **qalin**, uning ostida qisqa javob.",
+  "IQTIBOS: asosiy fikrni alohida qatorda '> ' bilan (iqtibos bloki) ajrat, atrofida qisqa izoh.",
+  "MINI-HIKOYA: 3-5 gapli jonli hikoya, kuchli boshlanish; faqat birinchi qator **qalin**.",
+  "MIF VA HAQIQAT: '❌ Mif: ...' va '✅ Haqiqat: ...' juftlari (2-3 ta), oxirida bitta xulosa.",
+  "ODDIY ABZATSLAR: 2-3 qisqa abzats, orasida bo'sh qator, bitta muhim jumla **qalin**.",
+];
+const pickStyle = () => STYLES[Math.floor(Math.random() * STYLES.length)];
+const STYLE_NOTE = "Faqat shu belgilar mumkin: **qalin**, qator boshida '> ' (iqtibos), '- ' (punkt). HTML teg YOZMA.";
+
 const POST_JSON = `Javobni FAQAT quyidagi JSON formatida ber, boshqa hech narsa yozma:
 {
   "hook": "rasm ustiga chiqadigan sarlavha (max 60 belgi, hook formulalaridan biri, o'ziga xos)",
-  "caption": "to'liq post matni, oddiy matn (HTML teg yo'q), emoji bilan, ko'z yugurtirib o'qiladigan",
+  "caption": "to'liq post matni, emoji bilan, ko'z yugurtirib o'qiladigan; KO'RINISH USLUBI ko'rsatilgan bo'lsa shunga amal qil (HTML teg yo'q)",
   "theme": "post mavzusi 1-2 so'zda",
   "pillar": "kontent ustuni nomi (ISHONCH, AMALIY MASLAHAT, MIF VA HAQIQAT, HIKOYA, SAVOL, ILOVA, QADRIYAT yoki MAVSUMIY)",
   "post_format": "format (ro'yxat, mif/haqiqat, mini-hikoya, savol/tanlov, qo'llanma, ilova-imkoniyat, esse)",
@@ -360,7 +374,7 @@ const PLAN_JSON = `Javobni FAQAT quyidagi JSON formatida ber:
 const RULES = `Qoidalar:
 - Faqat o'zbek tilida (lotin).
 - Foydalanuvchilar soni ("${BRAND.usersLabel}", "ming foydalanuvchi" va h.k.) haqida postda UMUMAN yozma, agar admin aniq so'ramasa.
-- Caption 500-850 belgi (QATIY 900 dan oshmasin; karuselda 200-450). 1-3 ta emoji. Oxirida yengil, har safar boshqacha CTA.
+- Caption 500-800 belgi (QATIY 850 dan oshmasin; karuselda 200-450). 1-3 ta emoji. Oxirida yengil, har safar boshqacha CTA.
 - Followerlardan "reaksiya bosing / like bosing" deb HECH QACHON so'rama.
 - MATNDA HAVOLA (URL, https, play.google...) yoki "sovchi.app" so'zini YOZMA — havola alohida qo'shiladi.
 
@@ -399,7 +413,7 @@ ${await metricsBlock()}
 ${nowBlock()} Mavsum, hafta kuni va yaqin bayramlarni o'rinli bo'lsagina hisobga ol.`;
 }
 
-function trimCaption(p: Post, limit = 880): Post {
+function trimCaption(p: Post, limit = 800): Post {
   let cap = String(p.caption ?? "").trim();
   if (cap.length > limit) {
     const cut = cap.slice(0, limit);
@@ -459,15 +473,18 @@ async function craft(type: PostType, task: string, plan?: unknown, note?: string
     ? `\nSTRATEGIYA REJASI (shunga amal qil, hook_options ichidan eng kuchlisini tanla yoki yaxshila):\n${JSON.stringify(plan, null, 2)}\n`
     : "";
   const schema = POST_SCHEMA[type];
+  const style = !note && ["text_image", "question", "video_text"].includes(type)
+    ? `\nKO'RINISH USLUBI (matn aynan shu ko'rinishda bo'lsin, boshqa postlardan farqli): ${pickStyle()} ${STYLE_NOTE}\n`
+    : "";
   let draft: Post = normalize(
     type,
-    await gemini(`${head}\n\nVAZIFA: ${task}\n${TYPE_BRIEF[type]}\n${nb}${planTxt}\n${RULES}\n\n${schema}`),
+    await gemini(`${head}\n\nVAZIFA: ${task}\n${TYPE_BRIEF[type]}\n${nb}${planTxt}${style}\n${RULES}\n\n${schema}`),
   );
   try {
     const final = normalize(
       type,
       await gemini(
-        `${head}\n\nVAZIFA: MUHARRIR. Quyidagi draftni SIFAT TEKSHIRUVI bo'yicha qattiq baho ber. Hook kuchsiz yoki umumiy bo'lsa — almashtir. Bo'sh gaplarni olib tashla, qiymatni aniqlashtir, keraksiz so'zlarni qisqartir. Soxta fakt, haqiqiy bo'lmagan va'da yoki romantik ohang bo'lsa — to'g'rila. Formatni (${type}) va uzunlik chegaralarini saqla. Draft yaxshi bo'lsa deyarli o'zgartirma. ADMIN IZOHI yoki REJA bandi bo'lsa, draft unga to'liq amal qilganini tekshir va uni BUZMA.\n${nb}\nVAZIFA TAVSIFI: ${task}\n\nDRAFT:\n${JSON.stringify(draft)}\n\n${RULES}\n\n${schema}`,
+        `${head}\n\nVAZIFA: MUHARRIR. Quyidagi draftni SIFAT TEKSHIRUVI bo'yicha qattiq baho ber. Hook kuchsiz yoki umumiy bo'lsa — almashtir. Bo'sh gaplarni olib tashla, qiymatni aniqlashtir, keraksiz so'zlarni qisqartir. Soxta fakt, haqiqiy bo'lmagan va'da yoki romantik ohang bo'lsa — to'g'rila. Formatni (${type}) va uzunlik chegaralarini saqla. Draft yaxshi bo'lsa deyarli o'zgartirma. ADMIN IZOHI yoki REJA bandi bo'lsa, draft unga to'liq amal qilganini tekshir va uni BUZMA. KO'RINISH USLUBI berilgan bo'lsa uni SAQLA.\n${nb}${style}\nVAZIFA TAVSIFI: ${task}\n\nDRAFT:\n${JSON.stringify(draft)}\n\n${RULES}\n\n${schema}`,
       ),
     );
     draft = final;
@@ -475,7 +492,7 @@ async function craft(type: PostType, task: string, plan?: unknown, note?: string
     console.warn("editor stage skipped:", e);
   }
   const clean = stripUserCount(draft, note);
-  return type === "poll" ? clean : trimCaption(clean, type === "carousel" ? 700 : 880);
+  return type === "poll" ? clean : trimCaption(clean, type === "carousel" ? 700 : 800);
 }
 
 async function generateNew(direction?: string, type: PostType = "text_image"): Promise<Post> {
@@ -512,10 +529,19 @@ function generateFromItem(it: PlanItem): Promise<Post> {
   );
 }
 
+// stored caption (HTML + footer link) -> plain text with the **bold** / "> " markers the writer uses
+function fromHtml(html: string): string {
+  const body = html.split("\n\n\u{1F449}")[0];
+  return body
+    .replace(/<\/?b>/g, "**").replace(/<\/?i>/g, "__")
+    .replace(/<blockquote>([\s\S]*?)<\/blockquote>/g, (_m, q: string) => q.split("\n").map((l) => "> " + l).join("\n"))
+    .replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
 const rewrite = (old: { caption: string; post_type?: string }, comment: string) =>
   craft(
     (POST_TYPES.includes(old.post_type as PostType) ? old.post_type : "text_image") as PostType,
-    `quyidagi MAVJUD draftni admin izohiga ko'ra QAYTA yoz.\n\n--- MAVJUD DRAFT ---\n${old.caption}\n--- TUGADI ---\n\nAvval admin izohini bajar; qolgan joyini brend uslubi va playbookka mos saqla.`,
+    `quyidagi MAVJUD draftni admin izohiga ko'ra QAYTA yoz.\n\n--- MAVJUD DRAFT ---\n${fromHtml(old.caption)}\n--- TUGADI ---\n\nAvval admin izohini bajar; qolgan joyini brend uslubi va playbookka mos saqla.`,
     undefined,
     comment,
   );
@@ -697,9 +723,10 @@ async function saveStickerSet(name: string) {
   return { title: set.title as string, count: rows.length, premium: rows.filter((r: any) => r.is_premium).length };
 }
 
-async function pickSticker(emoji?: string | null): Promise<string | null> {
-  const { data } = await db.from("sv_stickers").select("file_id, emoji, is_premium").limit(2000);
-  if (!data?.length) return null;
+async function pickSticker(emoji?: string | null, exclude?: string): Promise<string | null> {
+  const { data: all } = await db.from("sv_stickers").select("file_id, emoji, is_premium").limit(2000);
+  const data = (all ?? []).filter((s: any) => s.file_id !== exclude);
+  if (!data.length) return null;
   const wanted = Array.from(normEmoji(emoji ?? "")).filter((c) => c.trim());
   let pool = data.filter((s: any) => s.emoji && wanted.some((c) => normEmoji(s.emoji).includes(c)));
   if (!pool.length) pool = data;
@@ -730,8 +757,34 @@ const draftKeyboard = (id: string, type: string) => ({
   ],
 });
 
-const buildCaption = (c: string) =>
-  `${esc(c.trim())}\n\n👉 <a href="${BRAND.appLink.replace(/&/g, "&amp;")}">${BRAND.name}</a>\n${BRAND.channelMention}`;
+// **bold**, "> " quotes and "- " bullets -> Telegram HTML (everything else is escaped)
+function markup(plain: string): string {
+  const out: string[] = [];
+  let quote: string[] = [];
+  const flush = () => {
+    if (quote.length) out.push(`<blockquote>${quote.join("\n")}</blockquote>`);
+    quote = [];
+  };
+  for (const ln of esc(plain.trim()).split("\n")) {
+    const q = ln.match(/^&gt;\s?(.*)$/);
+    if (q) { quote.push(q[1]); continue; }
+    flush();
+    out.push(ln.replace(/^[-*]\s+/, "\u2022 "));
+  }
+  flush();
+  return out.join("\n")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/__(.+?)__/g, "<i>$1</i>")
+    .replace(/\*\*|__/g, ""); // leftovers of unmatched markers
+}
+
+const buildCaption = (c: string) => {
+  const foot = `\n\n\u{1F449} <a href="${BRAND.appLink.replace(/&/g, "&amp;")}">${BRAND.name}</a>\n${BRAND.channelMention}`;
+  let body = markup(c);
+  if ((body + foot).length > 1010) { // tags pushed it over Telegram's caption limit: fall back to plain text
+    body = esc(c.replace(/\*\*|__/g, "").replace(/^>\s?/gm, "").trim());
+  }
+  return body + foot;
+};
 
 const pollText = (p: PollData) =>
   `📊 <b>${esc(p.question)}</b>\n` + p.options.map((o, i) => `${p.is_quiz && p.correct_option_id === i ? "✅" : "▫️"} ${i + 1}. ${esc(o)}`).join("\n") +
@@ -836,7 +889,12 @@ async function markDraft(p: any, label: string) {
   const captioned = ["text_image", "question", "video_text"].includes(p.post_type ?? "text_image");
   try {
     if (captioned) {
-      await tg("editMessageCaption", { ...common, caption: `${label}\n\n${p.caption}`.slice(0, 1024), parse_mode: "HTML" });
+      const full = `${label}\n\n${p.caption}`;
+      if (full.length <= 1024) {
+        await tg("editMessageCaption", { ...common, caption: full, parse_mode: "HTML" });
+      } else { // keep the text, drop the markup instead of cutting a tag in half
+        await tg("editMessageCaption", { ...common, caption: full.replace(/<[^>]+>/g, "").slice(0, 1024) });
+      }
     } else {
       const body = p.post_type === "poll" && p.poll ? pollText(p.poll) : p.caption;
       await tg("editMessageText", { ...common, text: `${label}\n\n${body}`.slice(0, 4000), parse_mode: "HTML" });
@@ -1048,14 +1106,31 @@ async function publishPost(p: any) {
   if (publishToInstagram) {
     try { await publishToInstagram(p); } catch (e) { console.warn("instagram failed:", e); }
   }
-  // a mood-matching sticker right after the post; a failure must not undo the post
-  if (Math.random() < STICKER_CHANCE) {
-    try {
-      const sid = await pickSticker(p.sticker_emoji);
-      if (sid) await tg("sendSticker", { chat_id: CHANNEL, sticker: sid });
-    } catch (e) {
-      console.warn("sticker failed:", e);
+  await stickerAfter(p);
+}
+
+// One big emoji (Telegram shows a lone emoji as a large animation) when the sticker library is empty.
+function bigEmoji(mood?: string | null): string {
+  const e = Array.from(String(mood ?? "")).filter((c) => /\p{Extended_Pictographic}/u.test(c));
+  return e[0] ?? ["\u{1F339}", "\u{1F91D}", "\u{1F48D}", "\u{1F60A}"][Math.floor(Math.random() * 4)];
+}
+
+// A mood-matching sticker right after the post (sometimes two); a failure here must never undo the post.
+async function stickerAfter(p: any) {
+  if (STICKERS_OFF) return;
+  try {
+    const first = await pickSticker(p.sticker_emoji);
+    if (!first) {
+      await tg("sendMessage", { chat_id: CHANNEL, text: bigEmoji(p.sticker_emoji) });
+      return;
     }
+    await tg("sendSticker", { chat_id: CHANNEL, sticker: first });
+    if (Math.random() < SECOND_STICKER_CHANCE) {
+      const second = await pickSticker(p.sticker_emoji, first);
+      if (second) await tg("sendSticker", { chat_id: CHANNEL, sticker: second });
+    }
+  } catch (e) {
+    console.warn("sticker failed:", e);
   }
 }
 
@@ -1417,6 +1492,30 @@ const TYPE_ALIASES: Record<string, PostType> = {
   carousel: "carousel", karusel: "carousel", poll: "poll", sorovnoma: "poll", "so'rovnoma": "poll",
 };
 
+const HELP = `<b>sovchi.app kontent agenti \u2014 buyruqlar</b>
+
+<b>Post yaratish</b>
+/new \u2014 yangi post (matn+rasm)
+/new savol|karusel|poll [yo'nalish] \u2014 shu turdagi post, masalan: <code>/new karusel juma haqida</code>
+/reja \u2014 shu oyning kontent-rejasi va holati
+
+<b>Doimiy qoidalar</b>
+/qoida &lt;matn&gt; \u2014 har postda amal qiladigan qoida qo'shish
+/qoidalar \u2014 qoidalar ro'yxati
+/qoida_tozala \u2014 barcha qoidalarni o'chirish
+
+<b>Stikerlar</b>
+/pack &lt;nom yoki havola&gt; \u2014 stiker to'plamini kutubxonaga qo'shish
+/stickers \u2014 kutubxonada nechta stiker borligi
+(botga bitta stiker yuborsangiz ham, to'plami saqlanadi)
+
+<b>Draft bilan ishlash</b>
+\u2705 Joylash \u2192 vaqt tanlanadi \u2192 rejalanadi
+\u274c Rad etish \u2014 draftni bekor qilish
+\u{1F504} Boshqa rasm \u2014 matn o'zgarmaydi, rasm almashadi
+Draftga <b>reply</b> qilib izoh yozing \u2014 bot o'zi matnni, rasmni yoki ikkalasini o'zgartiradi.
+Boshqa kanaldan postni forward qilsangiz: \u{1F4DA} Namuna (uslubni o'rganadi) yoki \u270d\ufe0f Moslash.`;
+
 async function onMessage(msg: any) {
   const text: string | undefined = msg.text ?? msg.caption;
 
@@ -1435,6 +1534,10 @@ async function onMessage(msg: any) {
   }
 
   const cmd = text?.trim().split(/\s|@/)[0];
+
+  if (cmd === "/yordam" || cmd === "/help" || cmd === "/start") {
+    return void await say(HELP);
+  }
 
   if (cmd === "/pack") {
     const arg = text!.trim().split(/\s+/)[1] ?? "";
@@ -1644,6 +1747,19 @@ Deno.serve(async (req) => {
       drop_pending_updates: false,
     });
     return Response.json({ setWebhook: res });
+  }
+
+  if (has("seed_stickers")) {
+    const packs = (url.searchParams.get("packs") || "AnimatedEmojies").split(",").map((x) => x.trim()).filter(Boolean);
+    const out: Record<string, unknown> = {};
+    for (const name of packs) {
+      try {
+        out[name] = await saveStickerSet(name);
+      } catch (e) {
+        out[name] = String(e).slice(0, 160);
+      }
+    }
+    return Response.json(out);
   }
 
   if (has("generate_plan")) {
