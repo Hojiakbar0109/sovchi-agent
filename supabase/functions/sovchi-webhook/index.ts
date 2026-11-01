@@ -847,6 +847,23 @@ async function markDraft(p: any, label: string) {
   }
 }
 
+// Telegram cannot edit one message twice at the same time ("canceled by new edit message request"),
+// and picking a photo now takes 20-40s. One image job per draft; a second request waits for the first.
+async function withImageLock(id: string, fn: (fresh: any) => Promise<void>) {
+  const stale = new Date(Date.now() - 90_000).toISOString();
+  const { data: fresh } = await db.from("sv_posts").update({ image_lock_at: new Date().toISOString() })
+    .eq("id", id).eq("status", "pending").or(`image_lock_at.is.null,image_lock_at.lt.${stale}`)
+    .select().maybeSingle();
+  if (!fresh) {
+    return void await say("⏳ Bu draftning rasmi hozir yangilanyapti — tugashini kuting, keyin yana bosing.");
+  }
+  try {
+    await fn(fresh); // `fresh` already holds the latest photo state (used photos, query index)
+  } finally {
+    await db.from("sv_posts").update({ image_lock_at: null }).eq("id", id);
+  }
+}
+
 // Swap only the picture: same text, new photo and a freshly shuffled template.
 async function swapImage(p: any, query?: string | null) {
   if (p.post_type === "carousel" && p.media?.slides) {
@@ -870,7 +887,13 @@ async function swapImage(p: any, query?: string | null) {
   form.set("media", JSON.stringify({ type: "photo", media: "attach://photo", caption: p.caption, parse_mode: "HTML" }));
   form.set("photo", new Blob([image.bytes], { type: image.mime }), `${p.id}.${image.ext}`);
   form.set("reply_markup", JSON.stringify(draftKeyboard(p.id, p.post_type)));
-  const edited = await tg("editMessageMedia", form);
+  let edited: any;
+  try {
+    edited = await tg("editMessageMedia", form);
+  } catch (e) {
+    if (String(e).includes("canceled by new edit")) return; // a newer edit won; nothing to report
+    throw e;
+  }
   await db.from("sv_posts").update({
     photo_file_id: edited.photo[edited.photo.length - 1].file_id, layout: image.layout,
     image_query: image.state.queries[image.state.qi] ?? p.image_query ?? null, media: image.state,
@@ -887,7 +910,7 @@ async function onImg(cq: any, id: string) {
   if (data.post_type !== "carousel" && (!PIXABAY_KEY && !PEXELS_KEY)) {
     return void await say("⚠️ Rasm manbasi sozlanmagan (PIXABAY_API_KEY yo'q yoki bu draft eski).");
   }
-  await swapImage(data);
+  await withImageLock(id, (fresh) => swapImage(fresh));
 }
 
 // ---------- Approve -> time -> scheduled -> publish ----------
@@ -1486,7 +1509,7 @@ async function onMessage(msg: any) {
       const cls = canImage ? await classifyNote(old, text) : { scope: "text" as const, image_query: "" };
       if (cls.scope === "image") {
         await say("🖼 Faqat rasmni almashtiryapman (matn o'zgarmaydi)...");
-        return void await swapImage(old, cls.image_query || null);
+        return void await withImageLock(old.id, (fresh) => swapImage(fresh, cls.image_query || null));
       }
       await db.from("sv_posts").update({ status: "replaced" }).eq("id", old.id);
       await say(cls.scope === "text" ? "✍️ Matnni izohga ko'ra qayta yozyapman..." : "✍️ Matn va rasmni izohga ko'ra qayta yasayapman...");

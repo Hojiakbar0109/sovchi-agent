@@ -53,3 +53,5 @@ create index if not exists sv_plan_items_day_idx on public.sv_plan_items (post_d
 alter table public.sv_plan enable row level security;
 alter table public.sv_plan_items enable row level security;
 alter table public.sv_state enable row level security;
+
+alter table public.sv_posts add column if not exists image_lock_at timestamptz; -- one image job per draft
