@@ -19,7 +19,7 @@ export const SAFE_BOTTOM = H - Math.round(H * 0.05) - 14; // 1268
 const PAD = 70;
 
 type Corner = "tl" | "tr" | "bl" | "br";
-type Tpl = "bl" | "br" | "center" | "top" | "bar";
+type Tpl = "bl" | "br" | "center"; // text always sits on the photo; no solid red bands
 export type Layout = { tpl: Tpl; grad: "b" | "s"; acc: "bar" | "side" | "dots"; logo: Corner; num: Corner };
 
 // corners that stay free of the text block for each template
@@ -27,8 +27,6 @@ const FREE: Record<Tpl, Corner[]> = {
   bl: ["tl", "tr"],
   br: ["tl", "tr"],
   center: ["tl", "tr", "bl", "br"],
-  top: ["bl", "br"],
-  bar: ["tl", "tr"],
 };
 const TPLS = Object.keys(FREE) as Tpl[];
 const pick = <T>(a: T[]): T => a[Math.floor(Math.random() * a.length)];
@@ -177,8 +175,6 @@ function veil(img: Image, l: Layout) {
       }
       img.composite(new Image(W, H).fill(0x00000030), 0, 0);
     }
-  } else {
-    img.composite(new Image(W, H).fill(0x00000030), 0, 0);
   }
 }
 
@@ -212,10 +208,9 @@ export async function renderCard(inp: CardInput) {
   const darkSurface = onPhoto || !!inp.darkBg;
   if (onPhoto) veil(img, l);
 
-  const strip = l.tpl === "top" || l.tpl === "bar";
-  const textColor = strip ? BRAND.light : darkSurface ? 0xffffffff : BRAND.dark;
-  const kColor = strip ? BRAND.light : darkSurface ? 0xffffffd0 : BRAND.primary;
-  const accColor = strip ? BRAND.light : darkSurface ? 0xffffffff : BRAND.primary;
+  const textColor = darkSurface ? 0xffffffff : BRAND.dark;
+  const kColor = darkSurface ? 0xffffffd0 : BRAND.primary;
+  const accColor = darkSurface ? 0xffffffff : BRAND.primary;
   const align = l.tpl === "br" ? "r" : l.tpl === "center" ? "c" : "l";
   const maxW = W - 2 * PAD;
   const block = await textBlock(inp.theme ?? "", inp.hook, inp.sub ?? "", { align, color: textColor, kcolor: kColor, maxW });
@@ -234,19 +229,6 @@ export async function renderCard(inp: CardInput) {
     if (l.acc === "side") img.drawBox(PAD - 30, y + 1, 10, bh, accColor);
     else if (l.acc === "dots") for (let i = 0; i < 3; i++) img.drawBox(W / 2 - 42 + i * 28 + 1, y + bh + 30 + 1, 14, 14, accColor);
     else img.drawBox(W / 2 - 75 + 1, y + bh + 30 + 1, 150, 12, accColor);
-  } else if (l.tpl === "top") {
-    const bandH = bh + 120;
-    img.drawBox(1, SAFE_TOP, W, bandH, BRAND.primary);
-    img.composite(block, PAD, SAFE_TOP + 50);
-    if (l.acc === "side") img.drawBox(1, SAFE_TOP, 18, bandH, BRAND.light);
-    else img.drawBox(PAD + 1, SAFE_TOP + bandH - 34 + 1, l.acc === "dots" ? 14 : 110, l.acc === "dots" ? 14 : 8, BRAND.light);
-  } else {
-    const stripH = bh + 170;
-    const y0 = H - stripH;
-    img.drawBox(1, y0 + 1, W, stripH, BRAND.primary);
-    img.composite(block, PAD, y0 + 60);
-    if (l.acc === "side") img.drawBox(1, y0 + 1, 18, stripH, BRAND.light);
-    else img.drawBox(PAD + 1, y0 + 24 + 1, l.acc === "dots" ? 14 : 110, l.acc === "dots" ? 14 : 8, BRAND.light);
   }
 
   // logo (text logo by default, image logo when BRAND_LOGO_URL is set)
