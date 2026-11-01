@@ -18,7 +18,8 @@ const TOKEN = env("TELEGRAM_BOT_TOKEN");
 const ADMIN = env("ADMIN_CHAT_ID");
 const CHANNEL = env("CHANNEL_ID");
 const GEMINI_KEY = env("GEMINI_API_KEY");
-const GEMINI_MODEL = env("GEMINI_MODEL") || "gemini-3.8-flash";
+const DEFAULT_MODEL = "gemini-3-flash-preview";
+const GEMINI_MODEL = env("GEMINI_MODEL") || DEFAULT_MODEL;
 const WEBHOOK_SECRET = env("WEBHOOK_SECRET");
 // Every published post gets a mood-matching sticker (35%: a second one). STICKER_CHANCE=0 switches stickers off.
 const STICKERS_OFF = env("STICKER_CHANCE") === "0";
@@ -119,6 +120,7 @@ const NON_TEXT = ["image", "tts", "audio", "speech", "embedding", "aqa", "vision
 
 let modelCache: string[] | null = null;
 let lastModelUsed = "";
+let failedAttempts = 0; // Gemini calls that errored (404 etc.); exposed by ?check&probe=1
 async function candidateModels() {
   if (modelCache) return modelCache;
   const order = [GEMINI_MODEL];
@@ -142,12 +144,18 @@ async function candidateModels() {
       for (let i = 0; i < 3; i++) if (ra[i] !== rb[i]) return Number(ra[i]) - Number(rb[i]);
       return a.localeCompare(b);
     });
-    for (const n of available) if (!order.includes(n)) order.push(n);
-    modelCache = order;
+    // a configured model that the API does not list (renamed/removed) would only cost a 404 on every call
+    const first = available.includes(GEMINI_MODEL) ? GEMINI_MODEL
+      : available.includes(DEFAULT_MODEL) ? DEFAULT_MODEL : available[0];
+    if (first) {
+      const ordered = [first, ...available.filter((n) => n !== first)];
+      modelCache = ordered;
+      return ordered;
+    }
   } catch (e) {
     console.warn("listModels failed:", e);
   }
-  return order;
+  return order[0] === DEFAULT_MODEL ? order : [...order, DEFAULT_MODEL];
 }
 
 type GOpts = { timeout?: number; budget?: number; attempts?: number; models?: number };
@@ -189,6 +197,7 @@ async function gemini(prompt: string, o: GOpts = {}): Promise<any> {
         return out;
       } catch (e: any) {
         lastErr = e;
+        failedAttempts++;
         console.warn(`Model '${model}' urinish ${attempt}/${attempts}: ${e}`);
         if (e?.status && e.status < 500 && e.status !== 429) break;
         if (attempt < attempts) await sleep(attempt * 1000);
@@ -1730,8 +1739,10 @@ Deno.serve(async (req) => {
         const models = await candidateModels();
         out.gemini_configured = GEMINI_MODEL;
         out.gemini_candidates = models.slice(0, 8);
+        failedAttempts = 0;
         await gemini('JSON: {"ok":true}', { timeout: 20_000, budget: 50_000, attempts: 1, models: 8 });
         out.gemini_working = lastModelUsed;
+        out.gemini_failed_attempts = failedAttempts; // 0 = first model answered, no 404 retries
       } catch (e) {
         out.gemini_error = String(e);
       }
