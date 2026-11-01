@@ -1,0 +1,38 @@
+name: Kunlik draftlar + video
+
+on:
+  schedule:
+    - cron: "30 2 * * *"   # 07:30 Toshkent
+  workflow_dispatch:
+
+jobs:
+  drafts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bugungi draftlar (matn/rasm/karusel/so'rovnoma)
+        env:
+          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          curl -fsS --retry 2 --max-time 60 "$SUPABASE_FUNCTION_URL/sovchi-webhook?generate_today=$WEBHOOK_SECRET"
+
+  video:
+    needs: drafts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: ffmpeg o'rnatish
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - name: Brendli video (video_text bandlari)
+        env:
+          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+        run: python scripts/make_video.py

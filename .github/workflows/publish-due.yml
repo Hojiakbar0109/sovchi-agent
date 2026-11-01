@@ -1,0 +1,22 @@
+name: Rejalangan postlarni joylash
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-due
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: publish_due
+        env:
+          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          curl -fsS --retry 2 --max-time 120 "$SUPABASE_FUNCTION_URL/sovchi-webhook?publish_due=$WEBHOOK_SECRET"

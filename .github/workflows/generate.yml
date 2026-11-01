@@ -1,9 +1,7 @@
 name: Draft yaratish
 
 on:
-  schedule:
-    - cron: "0 5 * * *"    # 10:00 Toshkent
-    - cron: "0 12 * * *"   # 17:00 Toshkent
+  # cron removed: v2 plans and drafts via plan.yml / daily.yml. Manual runs only.
   workflow_dispatch:        # qo'lda ishga tushirish uchun
 
 permissions:
