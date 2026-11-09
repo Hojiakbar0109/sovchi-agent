@@ -1,0 +1,31 @@
+name: Video o'zgartirish buyurtmalari
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # har 10 daqiqada: admin so'ragan video o'zgarishlarini bajaradi
+  workflow_dispatch:
+
+concurrency:
+  group: video-jobs
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: ffmpeg o'rnatish
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - name: Qayta yasash buyurtmalarini bajarish
+        env:
+          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+        run: python scripts/make_video.py jobs

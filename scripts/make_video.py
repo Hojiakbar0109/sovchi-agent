@@ -60,11 +60,16 @@ def download(url, path):
     return path
 
 
-def find_background(qs, tmp):
-    """-> ('video'|'photo', path) or (None, None). Vertical video first, then photos."""
+def find_background(qs, tmp, rotate=0):
+    """-> ('video'|'photo', path) or (None, None). Vertical video first, then photos.
+    `rotate` (>0) picks a different query/clip so 'Boshqa video' yields a new result."""
     if not PIXABAY:
         return None, None
-    for q in queries(qs):
+    qlist = queries(qs)
+    if rotate and qlist:
+        k = rotate % len(qlist)
+        qlist = qlist[k:] + qlist[:k]
+    for q in qlist:
         r = requests.get("https://pixabay.com/api/videos/", params={
             "key": PIXABAY, "q": q[:100], "safesearch": "true", "per_page": 30}, timeout=30)
         hits = [h for h in r.json().get("hits", []) if not is_unsafe(str(h.get("tags", "")))]
@@ -75,11 +80,15 @@ def find_background(qs, tmp):
             return 0 if v.get("height", 0) > v.get("width", 1) else 1
 
         hits.sort(key=vertical)
-        for h in hits[:3]:
+        pick = hits[:3]
+        if rotate and len(hits) > 3:
+            s = rotate % len(hits)
+            pick = (hits[s:] + hits[:s])[:3]
+        for h in pick:
             v = h["videos"].get("medium") or h["videos"].get("small")
             if v and v.get("url") and v.get("size", 0) < 40_000_000:
                 return "video", download(v["url"], os.path.join(tmp, "bg.mp4"))
-    for q in queries(qs):
+    for q in qlist:
         r = requests.get("https://pixabay.com/api/", params={
             "key": PIXABAY, "q": q[:100], "image_type": "photo", "orientation": "vertical",
             "safesearch": "true", "per_page": 30}, timeout=30)
@@ -101,13 +110,27 @@ def wrapped(path, text, width):
     return fp(path)
 
 
-def build(item, tmp):
+def pick_music(current=None, avoid=False):
+    """A track from assets/music. `current` is reused unless `avoid` (then a different one)."""
+    if not os.path.isdir(MUSIC_DIR):
+        return None
+    tracks = [f for f in os.listdir(MUSIC_DIR) if f.lower().endswith((".wav", ".mp3", ".ogg", ".m4a"))]
+    if not tracks:
+        return None
+    if avoid and current in tracks and len(tracks) > 1:
+        return random.choice([t for t in tracks if t != current])
+    if current in tracks:
+        return current
+    return random.choice(tracks)
+
+
+def build(item, tmp, rotate=0, current_music=None, avoid_music=False):
     hook = item["hook"]
     lines = item["lines"][:4]
     outro = item.get("outro") or "Ilovani yuklab oling"
     seg = [("hook", hook, 3.5)] + [("line", ln, 4.0) for ln in lines]
     total = sum(s[2] for s in seg) + 3.0  # + outro
-    kind, bg = find_background(item.get("queries", []), tmp)
+    kind, bg = find_background(item.get("queries", []), tmp, rotate)
     fps = 30
     if kind == "video":
         inputs = ["-stream_loop", "-1", "-i", bg]
@@ -149,13 +172,11 @@ def build(item, tmp):
                  f"x=(w-text_w)/2:y=(h/2)+190:enable='gte(t,{t0:.2f})'")
     chain.append("format=yuv420p")
 
-    tracks = []
-    if os.path.isdir(MUSIC_DIR):
-        tracks = [f for f in os.listdir(MUSIC_DIR) if f.lower().endswith((".wav", ".mp3", ".ogg", ".m4a"))]
+    chosen_music = pick_music(current_music, avoid_music)
     out = os.path.join(tmp, "reel.mp4")
     cmd = ["ffmpeg", "-y", "-loglevel", "error"] + inputs
-    if tracks:
-        cmd += ["-stream_loop", "-1", "-i", os.path.join(MUSIC_DIR, random.choice(tracks))]
+    if chosen_music:
+        cmd += ["-stream_loop", "-1", "-i", os.path.join(MUSIC_DIR, chosen_music)]
     else:
         cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
     cmd += [
@@ -169,20 +190,35 @@ def build(item, tmp):
     size = os.path.getsize(out)
     if size > 49_000_000 or total > 30:
         raise RuntimeError(f"video limitdan oshdi: {size} bayt, {total}s")
-    return out, total
+    return out, total, chosen_music
 
 
-def send_draft(item, path, duration):
+def kb_for(vid):
+    # label (Instagram story) + approve/reject + change clip/music
+    return {"inline_keyboard": [
+        [{"text": "📸 Instagram story + kanal", "callback_data": f"iginfo:{vid}"}],
+        [{"text": "✅ Joylash", "callback_data": f"approve:{vid}"},
+         {"text": "❌ Rad etish", "callback_data": f"reject:{vid}"}],
+        [{"text": "🎬 Boshqa video", "callback_data": f"vid_clip:{vid}"},
+         {"text": "🎵 Boshqa musiqa", "callback_data": f"vid_music:{vid}"}],
+    ]}
+
+
+def media_spec(item, music, clip_rotate=0):
+    return {
+        "hook": item["hook"], "lines": item["lines"], "outro": item.get("outro"),
+        "caption_plain": item.get("caption_plain", ""), "caption_html": item["caption_html"],
+        "queries": item.get("queries", []), "music": music, "clip_rotate": clip_rotate,
+    }
+
+
+def send_draft(item, path, duration, music):
     vid = str(int(time.time() * 1000)) + str(random.randint(0, 9))
-    kb = {"inline_keyboard": [[
-        {"text": "✅ Joylash", "callback_data": f"approve:{vid}"},
-        {"text": "❌ Rad etish", "callback_data": f"reject:{vid}"},
-    ]]}
     with open(path, "rb") as f:
         r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendVideo", data={
             "chat_id": ADMIN, "caption": item["caption_html"], "parse_mode": "HTML",
             "supports_streaming": "true", "width": 1080, "height": 1920, "duration": int(duration),
-            "reply_markup": json.dumps(kb)}, files={"video": ("reel.mp4", f, "video/mp4")}, timeout=300)
+            "reply_markup": json.dumps(kb_for(vid))}, files={"video": ("reel.mp4", f, "video/mp4")}, timeout=300)
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"sendVideo: {data}")
@@ -190,12 +226,30 @@ def send_draft(item, path, duration):
     reg = requests.post(BASE, params={"register_video": SECRET}, json={
         "id": vid, "plan_item_id": item["plan_item_id"], "caption": item["caption_html"],
         "file_id": m["video"]["file_id"], "admin_message_id": m["message_id"],
-        "sticker_emoji": item.get("sticker_emoji")}, timeout=60)
+        "sticker_emoji": item.get("sticker_emoji"), "media": media_spec(item, music)}, timeout=60)
     reg.raise_for_status()
     print("registered", reg.json())
 
 
-def main():
+# Rebuild: replace the video in the SAME admin draft message (editMessageMedia).
+def edit_draft(job, path, duration):
+    vid = job["id"]
+    media_obj = {
+        "type": "video", "media": "attach://v", "caption": job["caption_html"], "parse_mode": "HTML",
+        "supports_streaming": True, "width": 1080, "height": 1920, "duration": int(duration),
+    }
+    with open(path, "rb") as f:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/editMessageMedia", data={
+            "chat_id": ADMIN, "message_id": job["admin_message_id"],
+            "media": json.dumps(media_obj), "reply_markup": json.dumps(kb_for(vid))},
+            files={"v": ("reel.mp4", f, "video/mp4")}, timeout=300)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"editMessageMedia: {data}")
+    return data["result"]["video"]["file_id"]
+
+
+def run_pending():
     r = requests.get(BASE, params={"pending_videos": SECRET}, timeout=170)
     r.raise_for_status()
     items = r.json().get("items", [])
@@ -204,14 +258,51 @@ def main():
     for it in items:
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                path, dur = build(it, tmp)
-                send_draft(it, path, dur)
+                path, dur, music = build(it, tmp)
+                send_draft(it, path, dur, music)
         except Exception as e:  # keep going with the other items
             failed += 1
             print("video xato:", e, file=sys.stderr)
             requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
                 "chat_id": ADMIN, "text": f"⚠️ Video yasab bo'lmadi ({it.get('theme')}): {str(e)[:300]}"})
     sys.exit(1 if failed else 0)
+
+
+# Process admin-requested changes (clip / music / text): rebuild and edit the existing draft.
+def run_jobs():
+    r = requests.get(BASE, params={"video_jobs": SECRET}, timeout=170)
+    r.raise_for_status()
+    jobs = r.json().get("items", [])
+    print(f"{len(jobs)} ta qayta yasash buyurtmasi")
+    failed = 0
+    for job in jobs:
+        try:
+            change = job.get("change", "clip")
+            rotate = int(job.get("clip_rotate") or 0) if change == "clip" else 0
+            with tempfile.TemporaryDirectory() as tmp:
+                path, dur, music = build(
+                    job, tmp, rotate=rotate,
+                    current_music=job.get("music"), avoid_music=(change == "music"))
+                file_id = edit_draft(job, path, dur)
+            reg = requests.post(BASE, params={"register_video": SECRET}, json={
+                "id": job["id"], "plan_item_id": job.get("plan_item_id"), "caption": job["caption_html"],
+                "file_id": file_id, "admin_message_id": job["admin_message_id"],
+                "sticker_emoji": job.get("sticker_emoji"),
+                "media": media_spec(job, music, rotate)}, timeout=60)
+            reg.raise_for_status()
+            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
+                "chat_id": ADMIN, "text": "✅ Video yangilandi — yuqoridagi draftni tekshiring."})
+        except Exception as e:
+            failed += 1
+            print("rebuild xato:", e, file=sys.stderr)
+            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
+                "chat_id": ADMIN, "text": f"⚠️ Videoni yangilab bo'lmadi: {str(e)[:300]}"})
+    sys.exit(1 if failed else 0)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "pending"
+    run_jobs() if mode == "jobs" else run_pending()
 
 
 if __name__ == "__main__":

@@ -118,6 +118,17 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const NON_TEXT = ["image", "tts", "audio", "speech", "embedding", "aqa", "vision",
   "imagen", "veo", "live", "native-audio", "dialog"];
 
+// stable models with a larger free quota, tried when the preview model is rate-limited
+const FALLBACK_MODELS = ["gemini-flash-latest", "gemini-2.0-flash"];
+// models that answer 404 for this key
+const DEAD_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"];
+const RATE_LIMIT_MSG = "⏳ Gemini kunlik/daqiqalik bepul limiti tugadi. Bir necha daqiqadan keyin qayta urinib ko'ring yoki ertaga davom etadi.";
+
+// user-facing text for an error: a clear message for rate limits, raw text otherwise
+const errText = (e: unknown, max = 300) => (e as any)?.rateLimited ? RATE_LIMIT_MSG : String(e).slice(0, max);
+const finalErr = (e: unknown) =>
+  (e as any)?.status === 429 ? Object.assign(new Error(RATE_LIMIT_MSG), { rateLimited: true, status: 429 }) : e;
+
 let modelCache: string[] | null = null;
 let lastModelUsed = "";
 let failedLog: string[] = []; // "model: error" per failed call, shown by ?check&probe=1
@@ -146,17 +157,21 @@ async function candidateModels() {
       return a.localeCompare(b);
     });
     // a configured model that the API does not list (renamed/removed) would only cost a 404 on every call
-    const first = available.includes(GEMINI_MODEL) ? GEMINI_MODEL
-      : available.includes(DEFAULT_MODEL) ? DEFAULT_MODEL : available[0];
+    const usable = available.filter((n) => !DEAD_MODELS.includes(n));
+    const first = usable.includes(GEMINI_MODEL) ? GEMINI_MODEL
+      : usable.includes(DEFAULT_MODEL) ? DEFAULT_MODEL : usable[0];
     if (first) {
-      const ordered = [first, ...available.filter((n) => n !== first)];
+      // preview model first, then stable models with a bigger free quota, then the rest
+      const backups = FALLBACK_MODELS.filter((n) => n !== first && usable.includes(n));
+      const ordered = [first, ...backups, ...usable.filter((n) => n !== first && !backups.includes(n))];
       modelCache = ordered;
       return ordered;
     }
   } catch (e) {
     console.warn("listModels failed:", e);
   }
-  return order[0] === DEFAULT_MODEL ? order : [...order, DEFAULT_MODEL];
+  const base = order[0] === DEFAULT_MODEL ? order : [...order, DEFAULT_MODEL];
+  return [...base, ...FALLBACK_MODELS.filter((n) => !base.includes(n))];
 }
 
 type GOpts = { timeout?: number; budget?: number; attempts?: number; models?: number };
@@ -175,6 +190,13 @@ async function askModel(model: string, prompt: string, timeout: number) {
   if (!r.ok) {
     const err: any = new Error(`HTTP ${r.status} ${data?.error?.status ?? ""}`);
     err.status = r.status;
+    if (r.status === 429) {
+      // server hint: Retry-After header, else RetryInfo.retryDelay ("12s" / "12.5s")
+      const hdr = Number(r.headers.get("retry-after"));
+      const info = (data?.error?.details ?? []).find((d: any) => String(d?.["@type"]).includes("RetryInfo"));
+      const ri = parseFloat(String(info?.retryDelay ?? ""));
+      err.retryAfterMs = Number.isFinite(hdr) && hdr > 0 ? hdr * 1000 : Number.isFinite(ri) && ri > 0 ? ri * 1000 : 0;
+    }
     throw err;
   }
   let text: string = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
@@ -183,13 +205,21 @@ async function askModel(model: string, prompt: string, timeout: number) {
   return JSON.parse(text);
 }
 
+// After every model answered 429, fail fast for a while instead of burning the ~150s worker limit
+// (otherwise the worker is killed before the admin ever gets an error message).
+let rateLimitedUntil = 0;
+
 async function gemini(prompt: string, o: GOpts = {}): Promise<any> {
+  if (Date.now() < rateLimitedUntil) throw finalErr(Object.assign(new Error("429"), { status: 429 }));
   const timeout = o.timeout ?? 25_000, attempts = o.attempts ?? 3, maxModels = o.models ?? 4;
   let lastErr: unknown = null;
-  const deadline = Date.now() + (o.budget ?? 60_000);
+  const deadline = Date.now() + (o.budget ?? 90_000);
   for (const model of (await candidateModels()).slice(0, maxModels)) {
     for (let attempt = 1; attempt <= attempts; attempt++) {
-      if (Date.now() > deadline) throw lastErr ?? new Error("Gemini vaqt chegarasi tugadi");
+      if (Date.now() > deadline) {
+        if ((lastErr as any)?.status === 429) rateLimitedUntil = Date.now() + 60_000;
+        throw finalErr(lastErr ?? new Error("Gemini vaqt chegarasi tugadi"));
+      }
       try {
         const out = await askModel(model, prompt, timeout);
         console.log(`Model ishlatildi: ${model} (urinish ${attempt})`);
@@ -202,11 +232,18 @@ async function gemini(prompt: string, o: GOpts = {}): Promise<any> {
         failedLog.push(`${model}: ${String(e).slice(0, 80)}`);
         console.warn(`Model '${model}' urinish ${attempt}/${attempts}: ${e}`);
         if (e?.status && e.status < 500 && e.status !== 429) break;
-        if (attempt < attempts) await sleep(attempt * 1000);
+        if (attempt >= attempts) break;
+        if (e?.status === 429) {
+          // wait the server-suggested time, else 5s / 15s / 40s; if the budget can't cover it, try the next model
+          const wait = Math.min(e.retryAfterMs || [5000, 15000, 40000][Math.min(attempt, 3) - 1], 40_000);
+          if (Date.now() + wait > deadline) break;
+          await sleep(wait);
+        } else await sleep(attempt * 1000);
       }
     }
   }
-  throw lastErr ?? new Error("Hech qaysi model javob bermadi");
+  if ((lastErr as any)?.status === 429) rateLimitedUntil = Date.now() + 60_000;
+  throw finalErr(lastErr ?? new Error("Hech qaysi model javob bermadi"));
 }
 
 // ---------- Post model ----------
@@ -477,7 +514,7 @@ function normalize(type: PostType, raw: any): Post {
 }
 
 // Stage 2 (write, following the plan) + stage 3 (editor review, best-effort).
-async function craft(type: PostType, task: string, plan?: unknown, note?: string): Promise<Post> {
+async function craft(type: PostType, task: string, plan?: unknown, note?: string, review = false): Promise<Post> {
   const head = await header();
   const nb = noteBlock(note);
   const planTxt = plan
@@ -491,7 +528,7 @@ async function craft(type: PostType, task: string, plan?: unknown, note?: string
     type,
     await gemini(`${head}\n\nVAZIFA: ${task}\n${TYPE_BRIEF[type]}\n${nb}${planTxt}${style}\n${RULES}\n\n${schema}`),
   );
-  try {
+  if (review) try {
     const final = normalize(
       type,
       await gemini(
@@ -514,9 +551,10 @@ async function generateNew(direction?: string, type: PostType = "text_image"): P
       `${await header()}\n\nVAZIFA: STRATEGIYA. Tarix va metrikaga qarab keyingi post uchun eng yaxshi rejani tuz: ustunni (oxirgilardan FARQLI), formatni, auditoriya og'rig'ini va o'ziga xos burchakni tanla.${dir}\nPost turi: ${type}.\n\n${PLAN_JSON}`,
     );
   } catch (e) {
+    if ((e as any)?.rateLimited) throw e; // quota is exhausted: report it now instead of retrying in the write stage
     console.warn("strategy stage skipped:", e);
   }
-  return craft(type, "shu uslubda, kanalga yangi BITTA kuchli post yoz." + dir, plan, direction);
+  return craft(type, "shu uslubda, kanalga yangi BITTA kuchli post yoz." + dir, plan, direction, true);
 }
 
 type PlanItem = {
@@ -537,6 +575,8 @@ function generateFromItem(it: PlanItem): Promise<Post> {
       `ASOSIY FIKR (core_message) — post matni AYNAN shuni ochib bersin, boshqa mavzuga chalg'ima: "${it.core_message}". ` +
       `Hook g'oyasi: "${it.hook_idea}". CTA: "${it.cta}".`,
     plan,
+    undefined,
+    true,
   );
 }
 
@@ -564,23 +604,13 @@ const adapt = (source: string) =>
   );
 
 // Admin reply on a draft: rewrite the text, swap only the picture, or both.
-async function classifyNote(p: { hook?: string | null; caption: string }, note: string) {
-  try {
-    const r = await gemini(
-      `Admin telegram kanal draftiga izoh yozdi. Izoh nimani o'zgartirishni so'rayotganini aniqla.\n` +
-        `- "image": faqat RASM/ko'rinish haqida (rasm, fon, rang, boshqa surat, rasmda nima bo'lsin) — matn o'zgarmasin.\n` +
-        `- "text": faqat MATN haqida (qisqartir, ohang, so'z, fakt, CTA).\n- "both": ikkalasi yoki aniq emas.\n\n` +
-        `DRAFT HOOK: ${p.hook ?? ""}\nDRAFT MATN: ${p.caption.replace(/<[^>]+>/g, "").slice(0, 500)}\nIZOH: ${note}\n\n` +
-        `JSON: {"scope":"text|image|both","image_query":"scope image yoki both bo'lsa: yangi rasm uchun 2-4 INGLIZCHA so'z (bosiq, oilaviy, romantik emas), aks holda bo'sh"}`,
-      { timeout: 12_000, budget: 20_000, attempts: 1, models: 5 },
-    );
-    const scope = ["text", "image", "both"].includes(r?.scope) ? r.scope : "both";
-    const q = cut(r?.image_query, 80);
-    return { scope: scope as "text" | "image" | "both", image_query: q && !isUnsafe(q) ? q : "" };
-  } catch (e) {
-    console.warn("classifyNote failed, using both:", e);
-    return { scope: "both" as const, image_query: "" };
-  }
+// Keyword heuristic (no Gemini call): image words -> image, text words -> text, both/unclear -> both.
+function classifyNote(_p: { hook?: string | null; caption: string }, note: string) {
+  const n = note.toLowerCase();
+  const img = /rasm|surat|foto|image|photo|picture|rang|(^|\s)fon(\s|$)/.test(n);
+  const txt = /matn|text|so['’`ʻ]?z|qisqa|uzun|ohang|hook|cta|sarlavha|gap/.test(n);
+  const scope = img && !txt ? "image" : txt && !img ? "text" : "both";
+  return { scope: scope as "text" | "image" | "both", image_query: "" };
 }
 
 // ---------- Photos: concrete queries -> candidates -> Gemini picks the one that matches the text ----------
@@ -780,7 +810,7 @@ function markup(plain: string): string {
     const q = ln.match(/^&gt;\s?(.*)$/);
     if (q) { quote.push(q[1]); continue; }
     flush();
-    out.push(ln.replace(/^[-*]\s+/, "\u2022 "));
+    out.push(ln.replace(/^[-*]\s+/, "• "));
   }
   flush();
   return out.join("\n")
@@ -1104,9 +1134,110 @@ async function publishToTelegram(p: any): Promise<number> {
   return m.message_id;
 }
 
-// TODO(instagram): implement publishToInstagram(p) (Graph API container -> publish) and set sv_posts.ig_status
-// ('queued' | 'published' | 'failed'). It must never block or fail the Telegram publish.
-const publishToInstagram: ((p: any) => Promise<void>) | null = null;
+// ---- Instagram Stories (Graph API with Instagram Login) ----
+// Token lives in the DB (sv_state '__ig__'), seeded once via /ig_token and auto-refreshed here,
+// so it never silently expires and needs no secret-manager plumbing.
+const IG_GRAPH = "https://graph.instagram.com/v21.0";
+const IG_BASE = "https://graph.instagram.com";
+const IG_USER_ID = env("IG_USER_ID") || "17841479924246985";
+const IG_BUCKET = "ig-media";
+const IG_STATE_KEY = "__ig__";
+
+type IgCreds = { token: string; expires_at: string | null };
+
+async function igLoadCreds(): Promise<IgCreds | null> {
+  const { data } = await db.from("sv_state").select("payload").eq("chat_id", IG_STATE_KEY).maybeSingle();
+  const p = data?.payload as any;
+  return p?.token ? { token: p.token, expires_at: p.expires_at ?? null } : null;
+}
+
+async function igSaveCreds(token: string, expiresInSec?: number): Promise<string | null> {
+  const expires_at = expiresInSec ? new Date(Date.now() + expiresInSec * 1000).toISOString() : null;
+  await db.from("sv_state").upsert({
+    chat_id: IG_STATE_KEY, awaiting: null, payload: { token, expires_at }, updated_at: new Date().toISOString(),
+  });
+  return expires_at;
+}
+
+// Returns a valid token, refreshing it when it expires within 7 days (best-effort).
+async function igValidToken(): Promise<string> {
+  const c = await igLoadCreds();
+  if (!c) throw new Error("IG token yo'q — botga /ig_token <token> yuboring.");
+  const soon = c.expires_at && new Date(c.expires_at).getTime() - Date.now() < 7 * 86400_000;
+  if (soon) {
+    try {
+      const r = await fetch(`${IG_BASE}/refresh_access_token?grant_type=ig_refresh_token&access_token=${encodeURIComponent(c.token)}`);
+      const j = await r.json();
+      if (j.access_token) {
+        await igSaveCreds(j.access_token, j.expires_in);
+        return j.access_token;
+      }
+    } catch (_) { /* keep using the current token */ }
+  }
+  return c.token;
+}
+
+// Telegram file_id -> bytes -> public Supabase Storage URL (so Meta never sees the bot token).
+async function igUploadVideo(fileId: string): Promise<{ url: string; name: string }> {
+  const f = await tg("getFile", { file_id: fileId });
+  const r = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.file_path}`);
+  if (!r.ok) throw new Error(`Telegram file fetch: ${r.status}`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  await db.storage.createBucket(IG_BUCKET, { public: true }).catch(() => {});
+  const name = `story_${Date.now()}.mp4`;
+  const up = await db.storage.from(IG_BUCKET).upload(name, bytes, { contentType: "video/mp4", upsert: true });
+  if (up.error) throw new Error(`storage upload: ${up.error.message}`);
+  return { url: db.storage.from(IG_BUCKET).getPublicUrl(name).data.publicUrl, name };
+}
+
+// Create a STORIES container, wait for video processing, then publish it.
+async function igPublishStory(videoUrl: string, token: string): Promise<string> {
+  const c = await fetch(`${IG_GRAPH}/${IG_USER_ID}/media`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ media_type: "STORIES", video_url: videoUrl, access_token: token }),
+  });
+  const cj = await c.json();
+  if (!cj.id) throw new Error(`container: ${JSON.stringify(cj).slice(0, 300)}`);
+  for (let i = 0; i < 40; i++) {
+    await new Promise((res) => setTimeout(res, 3000));
+    const s = await fetch(`${IG_GRAPH}/${cj.id}?fields=status_code&access_token=${encodeURIComponent(token)}`);
+    const sj = await s.json();
+    if (sj.status_code === "FINISHED") break;
+    if (sj.status_code === "ERROR" || sj.status_code === "EXPIRED") throw new Error(`container ${sj.status_code}`);
+    if (i === 39) throw new Error("container tayyor bo'lmadi (timeout)");
+  }
+  const p = await fetch(`${IG_GRAPH}/${IG_USER_ID}/media_publish`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ creation_id: cj.id, access_token: token }),
+  });
+  const pj = await p.json();
+  if (!pj.id) throw new Error(`publish: ${JSON.stringify(pj).slice(0, 300)}`);
+  return pj.id;
+}
+
+// Posts video_text drafts as Instagram Stories. Never blocks/undoes the Telegram publish.
+async function publishToInstagram(p: any): Promise<void> {
+  if (p.post_type !== "video_text" || !p.video_file_id) return; // only branded video stories
+  if (!(await igLoadCreds())) {
+    console.warn("IG: token yo'q — story o'tkazib yuborildi");
+    return;
+  }
+  await db.from("sv_posts").update({ ig_status: "queued" }).eq("id", p.id);
+  let uploaded: { url: string; name: string } | null = null;
+  try {
+    const token = await igValidToken();
+    uploaded = await igUploadVideo(p.video_file_id);
+    const mediaId = await igPublishStory(uploaded.url, token);
+    await db.from("sv_posts").update({ ig_status: "published" }).eq("id", p.id);
+    await say(`📸 Instagram story joylandi.`);
+    console.log("IG story published", mediaId);
+  } catch (e) {
+    await db.from("sv_posts").update({ ig_status: "failed" }).eq("id", p.id);
+    await say(`⚠️ Instagram story joylanmadi: ${esc(String(e).slice(0, 300))}`);
+  } finally {
+    if (uploaded) await db.storage.from(IG_BUCKET).remove([uploaded.name]).catch(() => {});
+  }
+}
 
 async function publishPost(p: any) {
   const messageId = await publishToTelegram(p);
@@ -1160,7 +1291,7 @@ async function publishDue() {
     } catch (e) {
       await db.from("sv_posts").update({ status: "failed" }).eq("id", p.id);
       results[p.id] = "failed";
-      await say(`⚠️ Rejalangan post joylanmadi (${p.id}): ${esc(String(e).slice(0, 300))}`).catch(() => {});
+      await say(`⚠️ Rejalangan post joylanmadi (${p.id}): ${esc(errText(e))}`).catch(() => {});
     }
   }
   return { checked: due?.length ?? 0, results };
@@ -1337,7 +1468,7 @@ JSON:
       if (!summary && raw?.summary) summary = String(raw.summary).slice(0, 1500);
     } catch (e) {
       console.warn(`plan chunk ${label} failed:`, e);
-      failed.push(`${label}: ${String(e).slice(0, 120)}`);
+      failed.push(`${label}: ${errText(e, 120)}`);
     }
   };
 
@@ -1398,7 +1529,7 @@ async function runToday() {
       ok++;
     } catch (e) {
       await db.from("sv_plan_items").update({ status: "planned" }).eq("id", it.id);
-      await say(`⚠️ Reja bandini yasab bo'lmadi (${esc(it.theme ?? "")}): ${esc(String(e).slice(0, 250))}`).catch(() => {});
+      await say(`⚠️ Reja bandini yasab bo'lmadi (${esc(it.theme ?? "")}): ${esc(errText(e, 250))}`).catch(() => {});
     }
   }
   return ok;
@@ -1453,12 +1584,101 @@ async function registerVideo(b: any) {
     id, status: "pending", caption: String(b.caption), theme, pillar, post_type: "video_text", post_format: "video",
     video_file_id: String(b.file_id), admin_message_id: b.admin_message_id ?? null,
     plan_item_id: b.plan_item_id ?? null, sticker_emoji: b.sticker_emoji ?? null,
+    ...(b.media ? { media: b.media } : {}),
   });
   if (error) throw error;
   if (b.plan_item_id) {
     await db.from("sv_plan_items").update({ status: "draft_sent", post_id: id }).eq("id", b.plan_item_id);
   }
   return { ok: true, id };
+}
+
+// ---------- Video edit: admin asks to change the clip / music / script; GitHub Actions rebuilds ----------
+// Button "🎬 Boshqa video" / "🎵 Boshqa musiqa": mark the draft for rebuild (same text).
+async function onVideoChange(cq: any, id: string, kind: "clip" | "music") {
+  const { data: p } = await db.from("sv_posts").select("id, media, status, post_type").eq("id", id).maybeSingle();
+  if (!p || p.post_type !== "video_text") {
+    return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Topilmadi" });
+  }
+  if (p.status !== "pending") {
+    return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Allaqachon ishlangan" });
+  }
+  const media: any = { ...(p.media ?? {}), change: kind };
+  if (kind === "clip") media.clip_rotate = (Number(media.clip_rotate) || 0) + 1;
+  await db.from("sv_posts").update({ status: "rebuild", media }).eq("id", id).eq("status", "pending");
+  await tg("answerCallbackQuery", {
+    callback_query_id: cq.id, text: kind === "clip" ? "Boshqa tasvir tanlayapman 🎬" : "Boshqa musiqa qo'yyapman 🎵",
+  });
+  await say(kind === "clip"
+    ? "🎬 Videoga boshqa tasvir tanlayapman — bir necha daqiqada yangilanadi."
+    : "🎵 Videoga boshqa musiqa qo'yyapman — bir necha daqiqada yangilanadi.");
+}
+
+// Admin's free-text note on a video draft: change the clip, the music, or rewrite the script.
+async function requestVideoTextChange(old: any, note: string) {
+  const n = note.toLowerCase();
+  const music = /qo['’`ʻ]?shiq|musiqa|ovoz|audio|song|music|kuy/.test(n);
+  const clip = /video|klip|tasvir|rasm|surat|foto|fon|background|clip/.test(n);
+  const media: any = { ...(old.media ?? {}) };
+  if (music && !clip) {
+    media.change = "music";
+    await db.from("sv_posts").update({ status: "rebuild", media }).eq("id", old.id).eq("status", "pending");
+    return void await say("🎵 Boshqa musiqa qo'yyapman — bir necha daqiqada yangilanadi.");
+  }
+  if (clip && !music) {
+    media.change = "clip";
+    media.clip_rotate = (Number(media.clip_rotate) || 0) + 1;
+    await db.from("sv_posts").update({ status: "rebuild", media }).eq("id", old.id).eq("status", "pending");
+    return void await say("🎬 Videoga boshqa tasvir tanlayapman — bir necha daqiqada yangilanadi.");
+  }
+  // text (or both/unclear): rewrite the script to the note, keep it a video
+  await say("✍️ Video matnini izohga ko'ra qayta yozyapman...");
+  const spec = await regenVideoText(old, note);
+  Object.assign(media, spec, { change: "text" });
+  await db.from("sv_posts").update({
+    status: "rebuild", media, caption: spec.caption_html, sticker_emoji: spec.sticker_emoji ?? old.sticker_emoji,
+  }).eq("id", old.id).eq("status", "pending");
+  await say("🔄 Yangi matn bilan videoni qayta yasayapman — bir necha daqiqada keladi.");
+}
+
+// A fresh reel script (hook/lines/outro/caption/queries) from the old one + the admin note.
+async function regenVideoText(old: any, note: string) {
+  const prevText = old.media?.caption_plain ?? fromHtml(old.caption ?? "");
+  const raw = await gemini(
+    `${await header()}\n\nVAZIFA: mavjud brendli VIDEO (reel) matnini ADMIN IZOHIga ko'ra QAYTA yoz. Mavzu: "${old.theme ?? ""}".\n` +
+      `--- MAVJUD MATN ---\n${prevText}\n--- TUGADI ---\n${noteBlock(note)}\n${RULES}\n\n` +
+      `JSON: {"hook":"1-kadr sarlavhasi (max 45 belgi)","lines":["2-4 ta qisqa kadr matni, har biri max 70 belgi"],"outro":"yakuniy qisqa chaqiriq (max 40 belgi)","caption":"video ostidagi matn (200-450 belgi, oddiy matn)","image_query":"vertikal klip qidirish uchun 2-4 INGLIZCHA so'z","queries":["2-3 ta zaxira INGLIZCHA qidiruv"],"sticker_emoji":"1-3 emoji"}`,
+    { timeout: 40_000, budget: 80_000 },
+  );
+  const lines = (Array.isArray(raw?.lines) ? raw.lines : []).map((l: unknown) => cut(l, 90)).filter(Boolean).slice(0, 4);
+  if (!raw?.hook || lines.length < 2 || !raw?.caption) throw new Error("video matni to'liq emas");
+  const clean = stripUserCount({
+    post_type: "video_text", hook: cut(raw.hook, 70), caption: String(raw.caption), theme: old.theme ?? "",
+    slides: lines.map((l: string) => ({ hook: l, line: "" })),
+  });
+  const queries = [raw.image_query, ...(Array.isArray(raw.queries) ? raw.queries : [])]
+    .map((q) => cut(q, 80)).filter((q) => q && !isUnsafe(q));
+  const capPlain = trimCaption(clean).caption;
+  return {
+    hook: clean.hook, lines: clean.slides!.map((s) => s.hook), outro: cut(raw.outro, 60),
+    caption_plain: capPlain, caption_html: buildCaption(capPlain), queries, sticker_emoji: raw.sticker_emoji ?? null,
+  };
+}
+
+// Video rebuild jobs for GitHub Actions (ffmpeg): drafts marked 'rebuild'.
+async function videoJobs() {
+  const { data } = await db.from("sv_posts")
+    .select("id, media, admin_message_id, caption, plan_item_id, sticker_emoji, theme")
+    .eq("post_type", "video_text").eq("status", "rebuild").order("created_at").limit(5);
+  const items = ((data ?? []) as any[]).map((p) => ({
+    id: p.id, admin_message_id: p.admin_message_id, plan_item_id: p.plan_item_id,
+    change: p.media?.change ?? "clip",
+    hook: p.media?.hook ?? "", lines: p.media?.lines ?? [], outro: p.media?.outro ?? "",
+    caption_html: p.media?.caption_html ?? p.caption, caption_plain: p.media?.caption_plain ?? "",
+    queries: p.media?.queries ?? [], music: p.media?.music ?? null,
+    clip_rotate: p.media?.clip_rotate ?? 0, sticker_emoji: p.sticker_emoji,
+  }));
+  return { items };
 }
 
 // ---------- Metrics: channel reactions ----------
@@ -1503,29 +1723,29 @@ const TYPE_ALIASES: Record<string, PostType> = {
   carousel: "carousel", karusel: "carousel", poll: "poll", sorovnoma: "poll", "so'rovnoma": "poll",
 };
 
-const HELP = `<b>sovchi.app kontent agenti \u2014 buyruqlar</b>
+const HELP = `<b>sovchi.app kontent agenti — buyruqlar</b>
 
 <b>Post yaratish</b>
-/new \u2014 yangi post (matn+rasm)
-/new savol|karusel|poll [yo'nalish] \u2014 shu turdagi post, masalan: <code>/new karusel juma haqida</code>
-/reja \u2014 shu oyning kontent-rejasi va holati
+/new — yangi post (matn+rasm)
+/new savol|karusel|poll [yo'nalish] — shu turdagi post, masalan: <code>/new karusel juma haqida</code>
+/reja — shu oyning kontent-rejasi va holati
 
 <b>Doimiy qoidalar</b>
-/qoida &lt;matn&gt; \u2014 har postda amal qiladigan qoida qo'shish
-/qoidalar \u2014 qoidalar ro'yxati
-/qoida_tozala \u2014 barcha qoidalarni o'chirish
+/qoida &lt;matn&gt; — har postda amal qiladigan qoida qo'shish
+/qoidalar — qoidalar ro'yxati
+/qoida_tozala — barcha qoidalarni o'chirish
 
 <b>Stikerlar</b>
-/pack &lt;nom yoki havola&gt; \u2014 stiker to'plamini kutubxonaga qo'shish
-/stickers \u2014 kutubxonada nechta stiker borligi
+/pack &lt;nom yoki havola&gt; — stiker to'plamini kutubxonaga qo'shish
+/stickers — kutubxonada nechta stiker borligi
 (botga bitta stiker yuborsangiz ham, to'plami saqlanadi)
 
 <b>Draft bilan ishlash</b>
-\u2705 Joylash \u2192 vaqt tanlanadi \u2192 rejalanadi
-\u274c Rad etish \u2014 draftni bekor qilish
-\u{1F504} Boshqa rasm \u2014 matn o'zgarmaydi, rasm almashadi
-Draftga <b>reply</b> qilib izoh yozing \u2014 bot o'zi matnni, rasmni yoki ikkalasini o'zgartiradi.
-Boshqa kanaldan postni forward qilsangiz: \u{1F4DA} Namuna (uslubni o'rganadi) yoki \u270d\ufe0f Moslash.`;
+✅ Joylash → vaqt tanlanadi → rejalanadi
+❌ Rad etish — draftni bekor qilish
+\u{1F504} Boshqa rasm — matn o'zgarmaydi, rasm almashadi
+Draftga <b>reply</b> qilib izoh yozing — bot o'zi matnni, rasmni yoki ikkalasini o'zgartiradi.
+Boshqa kanaldan postni forward qilsangiz: \u{1F4DA} Namuna (uslubni o'rganadi) yoki ✍️ Moslash.`;
 
 async function onMessage(msg: any) {
   const text: string | undefined = msg.text ?? msg.caption;
@@ -1589,6 +1809,27 @@ async function onMessage(msg: any) {
     return void await say("🗑 Barcha doimiy qoidalar o'chirildi.");
   }
 
+  // /ig_token <token> — store the Instagram token (auto-refreshed later); the message is deleted for hygiene.
+  if (cmd === "/ig_token") {
+    const tok = text!.trim().replace(/^\S+\s*/, "").trim();
+    await tg("deleteMessage", { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {});
+    if (!tok) return void await say("Ishlatish: /ig_token <Instagram access token>");
+    await igSaveCreds(tok, 60 * 86400); // long-lived IG tokens last ~60 days
+    try {
+      const r = await fetch(`${IG_GRAPH}/${IG_USER_ID}?fields=username,account_type&access_token=${encodeURIComponent(tok)}`);
+      const j = await r.json();
+      if (j.username) return void await say(`✅ Instagram ulandi: <b>@${esc(j.username)}</b> (${esc(j.account_type || "")}). Token saqlandi va avtomatik yangilanib turadi.`);
+      return void await say(`⚠️ Token saqlandi, lekin tekshirishda xato: ${esc(JSON.stringify(j).slice(0, 300))}`);
+    } catch (e) {
+      return void await say(`Token saqlandi. Tekshirish xatosi: ${esc(String(e).slice(0, 200))}`);
+    }
+  }
+  if (cmd === "/ig") {
+    const c = await igLoadCreds();
+    if (!c) return void await say("📸 Instagram ulanmagan. Token olib, <code>/ig_token &lt;token&gt;</code> yuboring.");
+    return void await say(`📸 Instagram ulangan.\nToken muddati: <b>${c.expires_at ? fmtLocal(c.expires_at) : "noma'lum"}</b> (tugashiga yaqin o'zi yangilanadi).`);
+  }
+
   // /reja — show this month's plan (with approve buttons while it is still pending)
   if (cmd === "/reja") {
     const month = tashkent().month;
@@ -1617,17 +1858,18 @@ async function onMessage(msg: any) {
       .eq("admin_message_id", replied).eq("status", "pending").maybeSingle();
     if (old) {
       if (old.post_type === "video_text") {
-        return void await say("🎬 Video draftini matn orqali o'zgartirib bo'lmaydi — rad eting, yangisi yasaladi.");
+        return void await requestVideoTextChange(old, text);
       }
       const canImage = old.post_type !== "poll";
-      const cls = canImage ? await classifyNote(old, text) : { scope: "text" as const, image_query: "" };
+      const cls = canImage ? classifyNote(old, text) : { scope: "text" as const, image_query: "" };
       if (cls.scope === "image") {
         await say("🖼 Faqat rasmni almashtiryapman (matn o'zgarmaydi)...");
         return void await withImageLock(old.id, (fresh) => swapImage(fresh, cls.image_query || null));
       }
-      await db.from("sv_posts").update({ status: "replaced" }).eq("id", old.id);
       await say(cls.scope === "text" ? "✍️ Matnni izohga ko'ra qayta yozyapman..." : "✍️ Matn va rasmni izohga ko'ra qayta yasayapman...");
-      return void await sendDraft(await rewrite(old, text), { plan_item_id: old.plan_item_id });
+      const rewritten = await rewrite(old, text); // on error the old draft stays pending
+      await db.from("sv_posts").update({ status: "replaced" }).eq("id", old.id);
+      return void await sendDraft(rewritten, { plan_item_id: old.plan_item_id });
     }
   }
 
@@ -1685,6 +1927,14 @@ async function handle(u: any) {
       else if (action === "time") await onTime(cq, id);
       else if (action === "reject") await onReject(cq, id);
       else if (action === "img") await onImg(cq, id);
+      else if (action === "vid_clip") await onVideoChange(cq, id, "clip");
+      else if (action === "vid_music") await onVideoChange(cq, id, "music");
+      else if (action === "iginfo") {
+        await tg("answerCallbackQuery", {
+          callback_query_id: cq.id, show_alert: true,
+          text: "Bu video tasdiqlangach Telegram kanalga + Instagram story'ga chiqadi 📸",
+        });
+      }
       else if (action === "learn") await onLearn(cq, id);
       else if (action === "adapt") await onAdapt(cq, id);
       else if (action === "plan_ok") await onPlanOk(cq, id);
@@ -1695,7 +1945,7 @@ async function handle(u: any) {
     }
   } catch (e) {
     console.error(e);
-    await say(`⚠️ Xato: ${esc(String(e).slice(0, 300))}`).catch(() => {});
+    await say(`⚠️ Xato: ${esc(errText(e))}`).catch(() => {});
   }
 }
 
@@ -1704,7 +1954,7 @@ async function handle(u: any) {
 const background = (label: string, p: Promise<unknown>) => EdgeRuntime.waitUntil(
   p.catch(async (e) => {
     console.error(label, e);
-    await say(`⚠️ ${label} xatosi: ${esc(String(e).slice(0, 300))}`).catch(() => {});
+    await say(`⚠️ ${label} xatosi: ${esc(errText(e))}`).catch(() => {});
   }),
 );
 
@@ -1791,6 +2041,9 @@ Deno.serve(async (req) => {
   }
   if (has("pending_videos")) {
     return Response.json(await pendingVideos());
+  }
+  if (has("video_jobs")) {
+    return Response.json(await videoJobs());
   }
   if (has("register_video") && req.method === "POST") {
     try {
