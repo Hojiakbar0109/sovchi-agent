@@ -452,6 +452,8 @@ OVOZ (uslub): ${BRAND.voice}
 KANALNING ESKI POSTLARI (uslub va ohangni o'rgan):
 ${await samplesBlock()}
 
+${await learnedStyleBlock()}
+
 OXIRGI POSTLAR TARIXI (ustunlar va hooklarni TAKRORLAMA; "ADMIN RAD ETGAN" yo'nalishdan qoch):
 ${await historyBlock()}
 
@@ -1297,13 +1299,66 @@ async function publishDue() {
   return { checked: due?.length ?? 0, results };
 }
 
+// Reject = "boshqa variant ber": the agent re-proposes a fresh variant for the same plan item
+// until the admin approves. A one-off draft (no plan item) is simply rejected.
 async function onReject(cq: any, id: string) {
-  const { data } = await db.from("sv_posts").update({ status: "rejected" })
-    .eq("id", id).in("status", ["pending", "awaiting_time"]).select().maybeSingle();
-  if (!data) return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Allaqachon ishlangan" });
-  await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Rad etildi ❌" });
-  if (data.plan_item_id) await db.from("sv_plan_items").update({ status: "rejected" }).eq("id", data.plan_item_id);
-  await markDraft(data, "❌ RAD ETILDI");
+  const { data: p } = await db.from("sv_posts").select("*")
+    .eq("id", id).in("status", ["pending", "awaiting_time"]).maybeSingle();
+  if (!p) return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Allaqachon ishlangan" });
+
+  // Video: rebuild the SAME draft as a fresh variant (ffmpeg runs in GitHub Actions ~10 min).
+  if (p.post_type === "video_text" && p.plan_item_id) {
+    await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Boshqa video variant tayyorlayapman 🔁" });
+    try {
+      const spec = await regenVideoText(p, "oldingi video ADMINGA YOQMADI — butunlay BOSHQA hook, burchak va matn bilan yangi variant yoz");
+      const media = { ...(p.media ?? {}), ...spec, change: "text", clip_rotate: (Number(p.media?.clip_rotate) || 0) + 1 };
+      await db.from("sv_posts").update({
+        status: "rebuild", media, caption: spec.caption_html, sticker_emoji: spec.sticker_emoji ?? p.sticker_emoji,
+      }).eq("id", id);
+      await say("🔁 Boshqa video variant tayyorlanyapti — bir necha daqiqada yangilanadi.");
+    } catch (e) {
+      await db.from("sv_posts").update({ status: "rejected" }).eq("id", id);
+      await say(`⚠️ Yangi video variant yasab bo'lmadi: ${esc(errText(e, 200))}`);
+    }
+    return;
+  }
+
+  // Non-video: mark this one rejected, then generate a DIFFERENT variant for the same plan item.
+  await db.from("sv_posts").update({ status: "rejected" }).eq("id", id);
+  await markDraft(p, "❌ Rad etildi");
+  if (!p.plan_item_id) {
+    return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Rad etildi ❌" });
+  }
+  await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Boshqa variant yozyapman 🔁" });
+  const { data: it } = await db.from("sv_plan_items").select("*").eq("id", p.plan_item_id).maybeSingle();
+  if (!it) return;
+  await db.from("sv_plan_items").update({ status: "drafting" }).eq("id", it.id);
+  try {
+    await say("🔁 Boshqa variant yozyapman...");
+    await sendDraft(await generateVariant(it as PlanItem, p), { plan_item_id: it.id });
+  } catch (e) {
+    await db.from("sv_plan_items").update({ status: "planned" }).eq("id", it.id);
+    await say(`⚠️ Boshqa variant yasab bo'lmadi: ${esc(errText(e, 200))}`);
+  }
+}
+
+// A deliberately different take on the same plan item (used after a reject).
+function generateVariant(it: PlanItem, rejected: any): Promise<Post> {
+  const type = (POST_TYPES.includes(it.post_type as PostType) ? it.post_type : "text_image") as PostType;
+  const plan = {
+    pillar: it.pillar, angle: it.core_message, hook_options: [it.hook_idea].filter(Boolean), cta: it.cta,
+    why: "oylik reja bandi (admin oldingi variantni rad etdi)",
+  };
+  const prevHook = String(rejected?.hook ?? "").slice(0, 120);
+  return craft(
+    type,
+    `OYLIK REJA BANDI bo'yicha post yoz. Mavzu: "${it.theme}". Ustun: ${it.pillar}. ` +
+      `ASOSIY FIKR (core_message) — post AYNAN shuni ochib bersin: "${it.core_message}". CTA: "${it.cta}".`,
+    plan,
+    `Oldingi variant ADMINGA YOQMADI — butunlay BOSHQA hook, burchak va tuzilish bilan yoz` +
+      (prevHook ? ` (oldingi hook: "${prevHook}" — uni takrorlama).` : "."),
+    true,
+  );
 }
 
 async function onLearn(cq: any, id: string) {
@@ -1325,6 +1380,86 @@ async function onAdapt(cq: any, id: string) {
     chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] },
   });
   await sendDraft(await adapt(data.text));
+}
+
+// ---------- Learning from forwarded posts (text + image style + emoji) ----------
+async function learnedStyleBlock() {
+  const t = (await playbookRow("learned_style")).trim();
+  return t
+    ? `FORWARD QILINGAN POSTLARDAN O'RGANILGAN USLUB (faqat ilhom uchun, NUSXA KO'CHIRMA):\n${t}`
+    : "";
+}
+
+async function appendLearnedStyle(note: string) {
+  const cur = (await playbookRow("learned_style")).trim();
+  const merged = (cur ? cur + "\n" : "") + note.trim();
+  const capped = merged.length > 2500 ? merged.slice(merged.length - 2500) : merged; // keep it bounded
+  await db.from("sv_playbook").upsert({ key: "learned_style", body: capped, updated_at: new Date().toISOString() });
+}
+
+// One Gemini vision call that returns JSON for a prompt + image.
+async function askVision(prompt: string, imageBytes: Uint8Array): Promise<any> {
+  const parts = [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: b64(imageBytes) } }];
+  for (const model of (await candidateModels()).slice(0, 4)) {
+    try {
+      const r = await fetch(`${GEMINI_API}/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_KEY },
+        body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: "application/json" } }),
+        signal: AbortSignal.timeout(25_000),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) continue;
+      const t = String(data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "").replace(/```(?:json)?/g, "").trim();
+      return JSON.parse(t);
+    } catch (_) { /* try next model */ }
+  }
+  throw new Error("vision failed");
+}
+
+// Short Uzbek style lessons from a forwarded post (its text, image and emoji) — for inspiration, not copying.
+async function analyzeForwardStyle(text: string, photoFileId: string | null, emoji: string | null): Promise<string> {
+  const ask = `Bu boshqa kanaldan forward qilingan post. Uning USLUBINI qisqa (3-5 nuqta, o'zbekcha) tahlil qil — keyingi postlarimizga ilhom uchun, NUSXA KO'CHIRISH UCHUN EMAS. E'tibor ber: ohang, matn uzunligi va tuzilishi, rasmda matn bor-yo'qligi va qanday joylashgani, ranglar/kayfiyat, emoji/stiker ishlatilishi, nima e'tiborni tortadi.` +
+    (text ? `\n\nPOST MATNI:\n${text.slice(0, 900)}` : "") +
+    (emoji ? `\nEmoji/stiker: ${emoji}` : "") +
+    `\n\nJSON: {"note":"- ...\\n- ..."}`;
+  try {
+    if (photoFileId) {
+      const f = await tg("getFile", { file_id: photoFileId });
+      const r = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.file_path}`);
+      if (r.ok) {
+        const out = await askVision(ask, new Uint8Array(await r.arrayBuffer()));
+        return String(out?.note ?? "").slice(0, 700);
+      }
+    }
+    const out = await gemini(ask, { timeout: 25_000, budget: 40_000, attempts: 1, models: 4 });
+    return String(out?.note ?? "").slice(0, 700);
+  } catch (e) {
+    console.warn("analyzeForwardStyle failed:", e);
+    return "";
+  }
+}
+
+// A forwarded post: learn its style automatically, keep the text as a sample, offer to adapt it into a post.
+async function onForward(msg: any) {
+  const text = String(msg.text ?? msg.caption ?? "").trim();
+  const photo = msg.photo ? msg.photo[msg.photo.length - 1].file_id : null;
+  const emoji = msg.sticker?.emoji ?? null;
+  const id = String(Date.now());
+  await db.from("sv_forwards").insert({ id, text });
+  await say("📥 Forward qabul qilindi, uslubini o'rganyapman...");
+  const note = await analyzeForwardStyle(text, photo, emoji);
+  if (note) await appendLearnedStyle(note);
+  if (text) await db.from("sv_samples").upsert({ text }, { onConflict: "text", ignoreDuplicates: true });
+  const extra = text
+    ? { reply_to_message_id: msg.message_id, reply_markup: { inline_keyboard: [[{ text: "✍️ Shunga o'xshash post yoz", callback_data: `adapt:${id}` }]] } }
+    : {};
+  await say(
+    note
+      ? `📚 O'rgandim — keyingi postlarda shu uslubni hisobga olaman:\n${esc(note)}`
+      : "📚 Saqladim. Keyingi postlarda shu uslubdan o'rganaman.",
+    extra,
+  );
 }
 
 // ---------- Monthly content plan ----------
@@ -1909,18 +2044,8 @@ async function onMessage(msg: any) {
     }
   }
 
-  if (text && (msg.forward_origin || msg.forward_from_chat)) {
-    const id = String(Date.now());
-    await db.from("sv_forwards").insert({ id, text });
-    return void await say("Bu postni nima qilay?", {
-      reply_to_message_id: msg.message_id,
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "📚 Namuna", callback_data: `learn:${id}` },
-          { text: "✍️ Moslash", callback_data: `adapt:${id}` },
-        ]],
-      },
-    });
+  if ((msg.forward_origin || msg.forward_from_chat) && (text || msg.photo)) {
+    return void await onForward(msg);
   }
 }
 
