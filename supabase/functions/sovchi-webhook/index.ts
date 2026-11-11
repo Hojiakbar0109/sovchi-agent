@@ -1248,7 +1248,7 @@ async function publishPost(p: any) {
   if (publishToInstagram) {
     try { await publishToInstagram(p); } catch (e) { console.warn("instagram failed:", e); }
   }
-  await stickerAfter(p);
+  // (Postdan keyin alohida stiker yuborilmaydi — admin xohishiga ko'ra o'chirildi.)
 }
 
 // One big emoji (Telegram shows a lone emoji as a large animation) when the sticker library is empty.
@@ -1438,11 +1438,12 @@ VAZIFA: OYLIK KONTENT-REJANING BIR BO'LAGI. ${month} oyi uchun sovchi.app Telegr
 Faqat shu kunlar uchun (hafta kuni bilan): ${chunk.map((d) => `${d} ${wdOf(d)}`).join(", ")}
 
 TALABLAR:
-- Odatda kuniga 1 post (shu bo'lakda ${Math.max(4, chunk.length - 1)}-${chunk.length + 1} band), ba'zi kunlar bo'sh qolishi yoki 2 post bo'lishi mumkin.
-- Turlar: text_image (asosiy), question (ochiq savol), carousel (3-5 slayd), poll (so'rovnoma), video_text (qisqa brendli video). Shu bo'lakda taxminan: 1 video_text, 1 carousel, 1 poll, 1 question, qolgani text_image.
+- HAR KUN uchun MAJBURIY 1 ta video_text band — bu kunlik Instagram STORY bo'ladi va AYNI vaqtda Telegram kanalga ham (to'liqroq matn bilan) chiqadi. Demak shu bo'lakdagi HAR BIR kunda kamida bitta video_text bo'lsin.
+- Xilma-xillik uchun shu bo'lak davomida yana 2-3 ta QO'SHIMCHA Telegram posti qo'sh (carousel, poll, question yoki text_image) — bular faqat Telegram uchun. Hammasini bir kunga to'plama, turli kunlarga tarqat.
+- video_text mavzusi o'sha kunning yo'nalishiga mos, qisqa va hissiyotli bo'lsin (video ustida kam matn — hikoya tasvir va ohang orqali; to'liq matn Telegram caption'ida).
 - Ustunlarni (ISHONCH, AMALIY MASLAHAT, MIF VA HAQIQAT, HIKOYA, SAVOL, ILOVA, QADRIYAT, MAVSUMIY) aralashtir; ketma-ket bir xil ustun/turni qo'yma. METRIKADAGI g'oliblarga og'ish. Boshqa haftalar ham alohida tuziladi, shuning uchun mavzularni o'ziga xos tanla (umumiy "ishonch haqida" emas).
 - O'zbekiston mavsumiyligi va bayramlarini hisobga ol (to'y mavsumi, ob-havo, bayramlar, hafta kuni: juma — alohida ohang) — faqat aniq bilganingni yoz.
-- slot_time: ${PLAN_SLOTS.join(" / ")} dan biri (METRIKADAGI eng kuchli soatga og'ish).
+- slot_time: ${PLAN_SLOTS.join(" / ")} dan biri (METRIKADAGI eng kuchli soatga og'ish; video_text odatda 20:00).
 - Har band MAJBURIY maydonlari: date (YYYY-MM-DD), slot_time, post_type, pillar, theme, core_message (post MATNI aynan nima deydi / qaysi burchak — 1-2 aniq gap, eng muhim maydon), hook_idea, cta.
 - Foydalanuvchilar sonini hech qayerda tilga olma. Followerlardan reaksiya so'rama.
 ${previous}
@@ -1456,6 +1457,18 @@ JSON:
         it.pillar && it.theme && it.core_message && it.hook_idea && it.cta
       );
       if (!valid.length) throw new Error("yaroqli band yo'q");
+      // Guarantee a daily video (Instagram story + Telegram) for every day in the chunk.
+      const videoDays = new Set(valid.filter((it: any) => it.post_type === "video_text").map((it: any) => String(it.date)));
+      for (const d of chunk) {
+        if (videoDays.has(d)) continue;
+        const base = valid.find((it: any) => String(it.date) === d) ?? {};
+        valid.push({
+          date: d, slot_time: "20:00", post_type: "video_text",
+          pillar: base.pillar ?? "ISHONCH", theme: base.theme ?? "sovchilik qadriyatlari",
+          core_message: base.core_message ?? "Jiddiy niyat bilan tanishishda halollik, hurmat va oila qadriyatlari haqida qisqa, hissiyotli video.",
+          hook_idea: base.hook_idea ?? "Birinchi soniyada e'tiborni tort", cta: base.cta ?? "Ilovada jiddiy niyatdagilar bilan tanish",
+        });
+      }
       const rows = valid.map((it: any) => ({
         month, post_date: it.date,
         slot_time: /^\d{2}:\d{2}$/.test(String(it.slot_time)) ? it.slot_time : "14:00",
@@ -1548,7 +1561,7 @@ async function pendingVideos() {
       const raw = await gemini(
         `${await header()}\n\nVAZIFA: 20-25 soniyalik brendli vertikal VIDEO (reel) uchun matn. Mavzu: "${it.theme}". Ustun: ${it.pillar}. ` +
           `ASOSIY FIKR: "${it.core_message}". Hook g'oyasi: "${it.hook_idea}". CTA: "${it.cta}".\n${RULES}\n\n` +
-          `JSON: {"hook":"1-kadr sarlavhasi (max 45 belgi)","lines":["2-4 ta qisqa kadr matni, har biri max 70 belgi"],"outro":"yakuniy qisqa chaqiriq (max 40 belgi)","caption":"video ostidagi matn (200-450 belgi, oddiy matn)","image_query":"vertikal klip/foto qidirish uchun 2-4 INGLIZCHA so'z","queries":["2-3 ta zaxira INGLIZCHA qidiruv"],"sticker_emoji":"1-3 emoji"}`,
+          `JSON: {"hook":"1-kadr sarlavhasi (max 45 belgi)","lines":["2-4 ta qisqa kadr matni, har biri max 70 belgi"],"outro":"yakuniy qisqa chaqiriq (max 40 belgi)","caption":"Telegram kanal uchun TO'LIQ post matni (500-800 belgi, oddiy matn, emoji bilan): hook, qisqa tushuntirish va qiymat, oxirida yengil CTA. Instagram story'da bu matn ko'rinmaydi (u yerda faqat video ustidagi yozuv), shuning uchun Telegram uchun to'liq va mazmunli yoz.","image_query":"vertikal klip/foto qidirish uchun 2-4 INGLIZCHA so'z","queries":["2-3 ta zaxira INGLIZCHA qidiruv"],"sticker_emoji":"1-3 emoji"}`,
         { timeout: 40_000, budget: 80_000 },
       );
       const lines = (Array.isArray(raw?.lines) ? raw.lines : []).map((l: unknown) => cut(l, 90)).filter(Boolean).slice(0, 4);
@@ -1647,7 +1660,7 @@ async function regenVideoText(old: any, note: string) {
   const raw = await gemini(
     `${await header()}\n\nVAZIFA: mavjud brendli VIDEO (reel) matnini ADMIN IZOHIga ko'ra QAYTA yoz. Mavzu: "${old.theme ?? ""}".\n` +
       `--- MAVJUD MATN ---\n${prevText}\n--- TUGADI ---\n${noteBlock(note)}\n${RULES}\n\n` +
-      `JSON: {"hook":"1-kadr sarlavhasi (max 45 belgi)","lines":["2-4 ta qisqa kadr matni, har biri max 70 belgi"],"outro":"yakuniy qisqa chaqiriq (max 40 belgi)","caption":"video ostidagi matn (200-450 belgi, oddiy matn)","image_query":"vertikal klip qidirish uchun 2-4 INGLIZCHA so'z","queries":["2-3 ta zaxira INGLIZCHA qidiruv"],"sticker_emoji":"1-3 emoji"}`,
+      `JSON: {"hook":"1-kadr sarlavhasi (max 45 belgi)","lines":["2-4 ta qisqa kadr matni, har biri max 70 belgi"],"outro":"yakuniy qisqa chaqiriq (max 40 belgi)","caption":"Telegram kanal uchun TO'LIQ post matni (500-800 belgi, oddiy matn, emoji bilan): hook, qisqa tushuntirish va qiymat, oxirida yengil CTA. Instagram story'da bu matn ko'rinmaydi (u yerda faqat video ustidagi yozuv), shuning uchun Telegram uchun to'liq va mazmunli yoz.","image_query":"vertikal klip qidirish uchun 2-4 INGLIZCHA so'z","queries":["2-3 ta zaxira INGLIZCHA qidiruv"],"sticker_emoji":"1-3 emoji"}`,
     { timeout: 40_000, budget: 80_000 },
   );
   const lines = (Array.isArray(raw?.lines) ? raw.lines : []).map((l: unknown) => cut(l, 90)).filter(Boolean).slice(0, 4);
