@@ -9,15 +9,27 @@ jobs:
   drafts:
     runs-on: ubuntu-latest
     steps:
-      - name: Bugungi draftlar (matn/rasm/karusel/so'rovnoma)
+      - name: Bugungi draftlar (matn/rasm/karusel/so'rovnoma) — har biri alohida so'rovda
         env:
           SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
-          curl -fsS --retry 2 --max-time 60 "$SUPABASE_FUNCTION_URL/sovchi-webhook?generate_today=$WEBHOOK_SECRET"
+          # one draft per request: each item gets the edge function's full time budget
+          BASE="$SUPABASE_FUNCTION_URL/sovchi-webhook?generate_next=$WEBHOOK_SECRET"
+          SKIP=""
+          FIRST="&first=1"
+          for i in 1 2 3 4 5 6 7 8; do
+            R=$(curl -sS --max-time 170 "$BASE$FIRST&skip=$SKIP" || echo '{"done":false,"error":"curl"}')
+            echo "$i: $R"
+            FIRST=""
+            if [ "$(echo "$R" | jq -r '.done // false' 2>/dev/null || true)" = "true" ]; then break; fi
+            F=$(echo "$R" | jq -r '.failed // empty' 2>/dev/null || true)
+            if [ -n "$F" ]; then SKIP="${SKIP:+$SKIP,}$F"; fi
+          done
 
   video:
     needs: drafts
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -2,8 +2,13 @@ name: Oylik reja
 
 on:
   schedule:
-    - cron: "0 3 1 * *"   # har oy 1-kuni 08:00 Toshkent
+    - cron: "0 3 25 * *"  # har oy 25-kuni 08:00 Toshkent: KEYINGI oy rejasi (1-kungacha tasdiqlashga ulgurasiz)
+    - cron: "0 1 1 * *"   # 1-kuni 06:00 Toshkent: zaxira — joriy oy rejasi umuman yo'q bo'lsa
   workflow_dispatch:
+    inputs:
+      month:
+        description: "Oy (YYYY-MM). Bo'sh = joriy oy"
+        required: false
 
 jobs:
   plan:
@@ -13,5 +18,17 @@ jobs:
         env:
           SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          INPUT_MONTH: ${{ github.event.inputs.month }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
-          curl -fsS --retry 2 --max-time 60 "$SUPABASE_FUNCTION_URL/sovchi-webhook?generate_plan=$WEBHOOK_SECRET"
+          EXTRA=""
+          if [ -n "$INPUT_MONTH" ]; then
+            MONTH="$INPUT_MONTH"
+          elif [ "$SCHEDULE" = "0 3 25 * *" ]; then
+            MONTH=$(date -u -d "$(date -u +%Y-%m-01) +1 month" +%Y-%m)
+          else
+            MONTH=$(TZ=Asia/Tashkent date +%Y-%m)
+            EXTRA="&if_missing=1"
+          fi
+          echo "Oy: $MONTH"
+          curl -fsS --retry 2 --max-time 60 "$SUPABASE_FUNCTION_URL/sovchi-webhook?generate_plan=$WEBHOOK_SECRET&month=$MONTH$EXTRA"

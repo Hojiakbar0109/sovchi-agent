@@ -24,6 +24,7 @@ ADMIN = os.environ["ADMIN_CHAT_ID"]
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FONT = os.path.join(ROOT, "assets", "fonts", "DejaVuSans-Bold.ttf")
 MUSIC_DIR = os.path.join(ROOT, "assets", "music")
+MAX_VIDEO_BYTES = 19_000_000  # Bot API getFile limit is 20 MB (needed for the Instagram story upload)
 
 # --- keep in sync with isUnsafe / SAFE_QUERIES in supabase/functions/sovchi-webhook/index.ts ---
 SAFE_QUERIES = [
@@ -60,9 +61,29 @@ def download(url, path):
     return path
 
 
+def pixabay_hits(url, params):
+    """Safe hits for one search; [] on any error (rate limit, non-JSON body, network)."""
+    try:
+        r = requests.get(url, params={"key": PIXABAY, "safesearch": "true", "per_page": 30, **params}, timeout=30)
+        r.raise_for_status()
+        return [h for h in r.json().get("hits", []) if not is_unsafe(str(h.get("tags", "")))]
+    except Exception as e:
+        print(f"pixabay qidiruv xatosi ({params.get('q')}): {e}", file=sys.stderr)
+        return []
+
+
 def find_background(qs, tmp, rotate=0):
     """-> ('video'|'photo', path) or (None, None). Vertical video first, then photos.
-    `rotate` (>0) picks a different query/clip so 'Boshqa video' yields a new result."""
+    `rotate` (>0) picks a different query/clip so 'Boshqa video' yields a new result.
+    Never raises: a Pixabay problem falls back to the plain brand background."""
+    try:
+        return _find_background(qs, tmp, rotate)
+    except Exception as e:
+        print(f"fon topilmadi, oddiy fon ishlatiladi: {e}", file=sys.stderr)
+        return None, None
+
+
+def _find_background(qs, tmp, rotate=0):
     if not PIXABAY:
         return None, None
     qlist = queries(qs)
@@ -70,9 +91,7 @@ def find_background(qs, tmp, rotate=0):
         k = rotate % len(qlist)
         qlist = qlist[k:] + qlist[:k]
     for q in qlist:
-        r = requests.get("https://pixabay.com/api/videos/", params={
-            "key": PIXABAY, "q": q[:100], "safesearch": "true", "per_page": 30}, timeout=30)
-        hits = [h for h in r.json().get("hits", []) if not is_unsafe(str(h.get("tags", "")))]
+        hits = pixabay_hits("https://pixabay.com/api/videos/", {"q": q[:100]})
         random.shuffle(hits)
 
         def vertical(h):
@@ -87,15 +106,19 @@ def find_background(qs, tmp, rotate=0):
         for h in pick:
             v = h["videos"].get("medium") or h["videos"].get("small")
             if v and v.get("url") and v.get("size", 0) < 40_000_000:
-                return "video", download(v["url"], os.path.join(tmp, "bg.mp4"))
+                try:
+                    return "video", download(v["url"], os.path.join(tmp, "bg.mp4"))
+                except Exception as e:
+                    print(f"klip yuklanmadi: {e}", file=sys.stderr)
     for q in qlist:
-        r = requests.get("https://pixabay.com/api/", params={
-            "key": PIXABAY, "q": q[:100], "image_type": "photo", "orientation": "vertical",
-            "safesearch": "true", "per_page": 30}, timeout=30)
-        hits = [h for h in r.json().get("hits", []) if not is_unsafe(str(h.get("tags", "")))]
+        hits = pixabay_hits("https://pixabay.com/api/", {
+            "q": q[:100], "image_type": "photo", "orientation": "vertical"})
         if hits:
             h = random.choice(hits[:20])
-            return "photo", download(h.get("largeImageURL") or h["webformatURL"], os.path.join(tmp, "bg.jpg"))
+            try:
+                return "photo", download(h.get("largeImageURL") or h["webformatURL"], os.path.join(tmp, "bg.jpg"))
+            except Exception as e:
+                print(f"rasm yuklanmadi: {e}", file=sys.stderr)
     return None, None
 
 
@@ -183,12 +206,15 @@ def build(item, tmp, rotate=0, current_music=None, avoid_music=False):
         "-filter_complex",
         f"[0:v]{','.join(chain)}[v];[1:a]volume=0.22,afade=t=out:st={total - 2:.1f}:d=2[a]",
         "-map", "[v]", "-map", "[a]", "-t", f"{total:.1f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-r", str(fps),
+        # bitrate cap: ~30s x 3.5 Mbit/s ~= 13 MB. The edge function fetches the video back through the
+        # Bot API for Instagram, and getFile only serves files up to 20 MB.
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-maxrate", "3500k", "-bufsize", "7000k",
+        "-r", str(fps),
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out,
     ]
     subprocess.run(cmd, check=True)
     size = os.path.getsize(out)
-    if size > 49_000_000 or total > 30:
+    if size > MAX_VIDEO_BYTES or total > 30:
         raise RuntimeError(f"video limitdan oshdi: {size} bayt, {total}s")
     return out, total, chosen_music
 
@@ -263,9 +289,27 @@ def run_pending():
         except Exception as e:  # keep going with the other items
             failed += 1
             print("video xato:", e, file=sys.stderr)
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
-                "chat_id": ADMIN, "text": f"⚠️ Video yasab bo'lmadi ({it.get('theme')}): {str(e)[:300]}"})
+            report(BASE, "video_failed", {"plan_item_id": it.get("plan_item_id"), "error": str(e)[:300]})
+            notify_admin(f"⚠️ Video yasab bo'lmadi ({it.get('theme')}): {str(e)[:300]}")
     sys.exit(1 if failed else 0)
+
+
+def notify_admin(text):
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": ADMIN, "text": text}, timeout=30)
+    except Exception as e:
+        print("admin xabari yuborilmadi:", e, file=sys.stderr)
+
+
+def report(base, key, body):
+    """Tell the edge function that a job failed (best-effort)."""
+    try:
+        r = requests.post(base, params={key: SECRET}, json=body, timeout=60)
+        return r.json()
+    except Exception as e:
+        print(f"{key} xabari yuborilmadi:", e, file=sys.stderr)
+        return {}
 
 
 # Process admin-requested changes (clip / music / text): rebuild and edit the existing draft.
@@ -290,13 +334,14 @@ def run_jobs():
                 "sticker_emoji": job.get("sticker_emoji"),
                 "media": media_spec(job, music, rotate)}, timeout=60)
             reg.raise_for_status()
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
-                "chat_id": ADMIN, "text": "✅ Video yangilandi — yuqoridagi draftni tekshiring."})
+            notify_admin("✅ Video yangilandi — yuqoridagi draftni tekshiring.")
         except Exception as e:
             failed += 1
             print("rebuild xato:", e, file=sys.stderr)
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={
-                "chat_id": ADMIN, "text": f"⚠️ Videoni yangilab bo'lmadi: {str(e)[:300]}"})
+            # the edge function counts attempts: it retries on the next run and, after the last attempt,
+            # restores the previous video draft and tells the admin once (no message every 10 minutes)
+            res = report(BASE, "video_job_failed", {"id": job["id"], "error": str(e)[:300]})
+            print("video_job_failed:", res)
     sys.exit(1 if failed else 0)
 
 

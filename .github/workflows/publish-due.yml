@@ -1,18 +1,19 @@
-name: Rejalangan postlarni joylash
+name: Rejalangan postlarni joylash + video buyurtmalari
 
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
-concurrency:
-  group: publish-due
-  cancel-in-progress: false
-
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: publish-due
+      cancel-in-progress: false
+    outputs:
+      video_jobs: ${{ steps.jobs.outputs.count }}
     steps:
       - name: publish_due
         env:
@@ -20,3 +21,39 @@ jobs:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
           curl -fsS --retry 2 --max-time 120 "$SUPABASE_FUNCTION_URL/sovchi-webhook?publish_due=$WEBHOOK_SECRET"
+      - name: Video qayta yasash buyurtmalari bormi?
+        id: jobs
+        if: always()
+        env:
+          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          N=$(curl -fsS --max-time 60 "$SUPABASE_FUNCTION_URL/sovchi-webhook?video_jobs=$WEBHOOK_SECRET" | jq '.items | length' || echo 0)
+          echo "Buyurtmalar: $N"
+          echo "count=$N" >> "$GITHUB_OUTPUT"
+
+  # ffmpeg is installed only when the admin actually asked for a video change
+  rebuild:
+    needs: publish
+    if: always() && needs.publish.outputs.video_jobs != '' && needs.publish.outputs.video_jobs != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: video-jobs
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: ffmpeg o'rnatish
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - name: Qayta yasash buyurtmalarini bajarish
+        env:
+          SUPABASE_FUNCTION_URL: ${{ secrets.SUPABASE_FUNCTION_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+        run: python scripts/make_video.py jobs

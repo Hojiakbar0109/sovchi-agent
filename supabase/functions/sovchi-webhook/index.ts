@@ -21,9 +21,6 @@ const GEMINI_KEY = env("GEMINI_API_KEY");
 const DEFAULT_MODEL = "gemini-3-flash-preview";
 const GEMINI_MODEL = env("GEMINI_MODEL") || DEFAULT_MODEL;
 const WEBHOOK_SECRET = env("WEBHOOK_SECRET");
-// Every published post gets a mood-matching sticker (35%: a second one). STICKER_CHANCE=0 switches stickers off.
-const STICKERS_OFF = env("STICKER_CHANCE") === "0";
-const SECOND_STICKER_CHANCE = 0.35;
 
 const db = createClient(env("SUPABASE_URL"), env("SUPABASE_SERVICE_ROLE_KEY"));
 
@@ -754,9 +751,7 @@ async function findPhoto(hook: string, caption: string, st: PhotoState): Promise
   return { bytes: null, state: { ...st, used: [...used].slice(-40) } };
 }
 
-// ---------- Stickers ----------
-const normEmoji = (s: string) => s.replace(/️/g, "");
-
+// ---------- Stickers (library only; nothing is sent after a post any more) ----------
 async function saveStickerSet(name: string) {
   const set = await tg("getStickerSet", { name });
   const rows = (set.stickers ?? []).slice(0, 200).map((s: any) => ({
@@ -764,18 +759,6 @@ async function saveStickerSet(name: string) {
   }));
   if (rows.length) await db.from("sv_stickers").upsert(rows, { onConflict: "file_id" });
   return { title: set.title as string, count: rows.length, premium: rows.filter((r: any) => r.is_premium).length };
-}
-
-async function pickSticker(emoji?: string | null, exclude?: string): Promise<string | null> {
-  const { data: all } = await db.from("sv_stickers").select("file_id, emoji, is_premium").limit(2000);
-  const data = (all ?? []).filter((s: any) => s.file_id !== exclude);
-  if (!data.length) return null;
-  const wanted = Array.from(normEmoji(emoji ?? "")).filter((c) => c.trim());
-  let pool = data.filter((s: any) => s.emoji && wanted.some((c) => normEmoji(s.emoji).includes(c)));
-  if (!pool.length) pool = data;
-  const premium = pool.filter((s: any) => s.is_premium);
-  if (premium.length && Math.random() < 0.5) pool = premium;
-  return pool[Math.floor(Math.random() * pool.length)].file_id;
 }
 
 // ---------- Admin state (awaiting free-text answers) ----------
@@ -936,7 +919,8 @@ async function markDraft(p: any, label: string) {
       if (full.length <= 1024) {
         await tg("editMessageCaption", { ...common, caption: full, parse_mode: "HTML" });
       } else { // keep the text, drop the markup instead of cutting a tag in half
-        await tg("editMessageCaption", { ...common, caption: full.replace(/<[^>]+>/g, "").slice(0, 1024) });
+        const plain = full.replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+        await tg("editMessageCaption", { ...common, caption: plain.slice(0, 1024) });
       }
     } else {
       const body = p.post_type === "poll" && p.poll ? pollText(p.poll) : p.caption;
@@ -1064,8 +1048,7 @@ async function onTime(cq: any, rest: string) {
     return void await say("🕐 Vaqtni yozing: <code>15:30</code>, <code>ertaga 09:00</code> yoki <code>2026-11-05 18:00</code> (Toshkent).");
   }
   if (arg === "now") {
-    const { data: claimed } = await db.from("sv_posts").update({ status: "publishing" })
-      .eq("id", id).eq("status", "awaiting_time").select().maybeSingle();
+    const claimed = await claimForPublish(id, "awaiting_time");
     if (!claimed) return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Allaqachon ishlangan" });
     await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Joylayapman 🚀" });
     await setState(null);
@@ -1181,7 +1164,12 @@ async function igValidToken(): Promise<string> {
 
 // Telegram file_id -> bytes -> public Supabase Storage URL (so Meta never sees the bot token).
 async function igUploadVideo(fileId: string): Promise<{ url: string; name: string }> {
-  const f = await tg("getFile", { file_id: fileId });
+  // Bot API serves files up to 20 MB only (make_video.py keeps reels under 19 MB for this reason)
+  const f = await tg("getFile", { file_id: fileId }).catch((e) => {
+    throw String(e).includes("too big")
+      ? new Error("video 20 MB dan katta — Telegram bot uni yuklab bera olmaydi (videoni qayta yasang)")
+      : e;
+  });
   const r = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.file_path}`);
   if (!r.ok) throw new Error(`Telegram file fetch: ${r.status}`);
   const bytes = new Uint8Array(await r.arrayBuffer());
@@ -1241,53 +1229,61 @@ async function publishToInstagram(p: any): Promise<void> {
   }
 }
 
-async function publishPost(p: any) {
+async function publishPost(p: any, opts: { igInBackground?: boolean } = {}) {
   const messageId = await publishToTelegram(p);
   await db.from("sv_posts").update({
     status: "published", published_at: new Date().toISOString(), channel_message_id: messageId,
   }).eq("id", p.id);
   if (p.plan_item_id) await db.from("sv_plan_items").update({ status: "published" }).eq("id", p.plan_item_id);
-  if (publishToInstagram) {
-    try { await publishToInstagram(p); } catch (e) { console.warn("instagram failed:", e); }
-  }
+  // Instagram never undoes or blocks the Telegram publish (publishToInstagram reports its own errors)
+  const ig = publishToInstagram(p).catch((e) => console.warn("instagram failed:", e));
+  if (opts.igInBackground) background("Instagram story", ig);
+  else await ig;
   // (Postdan keyin alohida stiker yuborilmaydi — admin xohishiga ko'ra o'chirildi.)
 }
 
-// One big emoji (Telegram shows a lone emoji as a large animation) when the sticker library is empty.
-function bigEmoji(mood?: string | null): string {
-  const e = Array.from(String(mood ?? "")).filter((c) => /\p{Extended_Pictographic}/u.test(c));
-  return e[0] ?? ["\u{1F339}", "\u{1F91D}", "\u{1F48D}", "\u{1F60A}"][Math.floor(Math.random() * 4)];
+// Work killed by the runtime's wall-clock limit leaves rows half-way. Runs every 10 min (publish_due):
+// - 'publishing' too long: the Telegram send may or may not have happened -> 'failed' + ask the admin to check
+//   (never re-publish blindly: a duplicate in the channel is worse than a missed post);
+// - Instagram 'queued' too long -> 'failed';
+// - plan items stuck in 'drafting' / 'video_making' -> back to 'planned'.
+async function recoverStale() {
+  const ago = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+  const { data: stuck } = await db.from("sv_posts").update({ status: "failed" })
+    .eq("status", "publishing").lt("claimed_at", ago(10)).select("id, theme, hook, channel_message_id");
+  for (const p of stuck ?? []) {
+    await say(
+      `⚠️ Post joylanishi yarim yo'lda to'xtab qoldi (${p.id}: ${esc(String(p.theme ?? p.hook ?? "").slice(0, 60))}). ` +
+        `Kanalni tekshiring — chiqmagan bo'lsa, qayta /new qiling.`,
+    ).catch(() => {});
+  }
+  const { data: ig } = await db.from("sv_posts").update({ ig_status: "failed" })
+    .eq("ig_status", "queued").lt("published_at", ago(15)).select("id");
+  if (ig?.length) await say(`⚠️ Instagram story joylanmadi (vaqt tugadi): ${ig.length} ta video.`).catch(() => {});
+  await db.from("sv_plan_items").update({ status: "planned", claimed_at: null })
+    .eq("status", "drafting").lt("claimed_at", ago(15));
+  await db.from("sv_plan_items").update({ status: "planned", claimed_at: null })
+    .eq("status", "video_making").lt("claimed_at", ago(40));
 }
 
-// A mood-matching sticker right after the post (sometimes two); a failure here must never undo the post.
-async function stickerAfter(p: any) {
-  if (STICKERS_OFF) return;
-  try {
-    const first = await pickSticker(p.sticker_emoji);
-    if (!first) {
-      await tg("sendMessage", { chat_id: CHANNEL, text: bigEmoji(p.sticker_emoji) });
-      return;
-    }
-    await tg("sendSticker", { chat_id: CHANNEL, sticker: first });
-    if (Math.random() < SECOND_STICKER_CHANCE) {
-      const second = await pickSticker(p.sticker_emoji, first);
-      if (second) await tg("sendSticker", { chat_id: CHANNEL, sticker: second });
-    }
-  } catch (e) {
-    console.warn("sticker failed:", e);
-  }
+// Atomically take a post for publishing (only from `from` status).
+async function claimForPublish(id: string, from: string) {
+  const { data } = await db.from("sv_posts").update({ status: "publishing", claimed_at: new Date().toISOString() })
+    .eq("id", id).eq("status", from).select().maybeSingle();
+  return data;
 }
 
 async function publishDue() {
+  await recoverStale().catch((e) => console.warn("recoverStale failed:", e));
   const { data: due } = await db.from("sv_posts").select("*").eq("status", "scheduled")
     .lte("scheduled_at", new Date().toISOString()).order("scheduled_at").limit(10);
   const results: Record<string, string> = {};
   for (const p of due ?? []) {
-    const { data: claimed } = await db.from("sv_posts").update({ status: "publishing" })
-      .eq("id", p.id).eq("status", "scheduled").select().maybeSingle();
+    const claimed = await claimForPublish(p.id, "scheduled");
     if (!claimed) continue;
     try {
-      await publishPost(claimed);
+      // Instagram runs after the response, so this request stays short (no curl timeout / killed worker)
+      await publishPost(claimed, { igInBackground: true });
       results[p.id] = "published";
       await say(`✅ Kanalga joylandi (${TYPE_LABEL[p.post_type] ?? p.post_type}): ${esc(String(p.theme ?? p.hook ?? "").slice(0, 60))}`).catch(() => {});
     } catch (e) {
@@ -1311,7 +1307,10 @@ async function onReject(cq: any, id: string) {
     await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Boshqa video variant tayyorlayapman 🔁" });
     try {
       const spec = await regenVideoText(p, "oldingi video ADMINGA YOQMADI — butunlay BOSHQA hook, burchak va matn bilan yangi variant yoz");
-      const media = { ...(p.media ?? {}), ...spec, change: "text", clip_rotate: (Number(p.media?.clip_rotate) || 0) + 1 };
+      const media = {
+        ...(p.media ?? {}), ...spec, change: "text", clip_rotate: (Number(p.media?.clip_rotate) || 0) + 1,
+        prev_caption: p.caption, attempts: 0,
+      };
       await db.from("sv_posts").update({
         status: "rebuild", media, caption: spec.caption_html, sticker_emoji: spec.sticker_emoji ?? p.sticker_emoji,
       }).eq("id", id);
@@ -1332,12 +1331,12 @@ async function onReject(cq: any, id: string) {
   await tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Boshqa variant yozyapman 🔁" });
   const { data: it } = await db.from("sv_plan_items").select("*").eq("id", p.plan_item_id).maybeSingle();
   if (!it) return;
-  await db.from("sv_plan_items").update({ status: "drafting" }).eq("id", it.id);
+  await db.from("sv_plan_items").update({ status: "drafting", claimed_at: new Date().toISOString() }).eq("id", it.id);
   try {
     await say("🔁 Boshqa variant yozyapman...");
     await sendDraft(await generateVariant(it as PlanItem, p), { plan_item_id: it.id });
   } catch (e) {
-    await db.from("sv_plan_items").update({ status: "planned" }).eq("id", it.id);
+    await db.from("sv_plan_items").update({ status: "planned", claimed_at: null }).eq("id", it.id);
     await say(`⚠️ Boshqa variant yasab bo'lmadi: ${esc(errText(e, 200))}`);
   }
 }
@@ -1644,6 +1643,10 @@ async function onPlanOk(cq: any, month: string) {
     chat_id: cq.message.chat.id, message_id: cq.message.message_id,
     text: `✅ ${month} rejasi tasdiqlandi. Har kuni ertalab bugungi draftlar yuboriladi.`,
   }).catch(() => {});
+  // approved after this morning's run (e.g. on the 1st): make today's drafts now instead of losing the day
+  if (month === tashkent().month && tashkent().hh >= 7) {
+    background("Bugungi draftlar", runToday());
+  }
 }
 
 async function onPlanEdit(cq: any, month: string) {
@@ -1653,34 +1656,54 @@ async function onPlanEdit(cq: any, month: string) {
 }
 
 // ---------- Daily drafts from the active plan ----------
-async function runToday() {
+// Drafts ONE of today's planned (non-video) items per call, so every item gets a full runtime budget
+// (several items in one call outlived the edge worker and left them stuck in 'drafting').
+// daily.yml calls ?generate_next repeatedly until `done`. `first` = this is the first call of the day
+// (only then is the admin told that the plan is missing / not approved).
+async function draftNextToday(first = true, skip: number[] = []) {
   const t = tashkent();
-  const { data: plan } = await db.from("sv_plan").select("*").eq("month", t.month).maybeSingle();
+  const { data: plan } = await db.from("sv_plan").select("status").eq("month", t.month).maybeSingle();
   if (!plan) {
-    return void await say(`📅 ${t.month} oyi uchun kontent-reja topilmadi, shuning uchun bugungi draftlar yaratilmadi. Reja yaratish: generate_plan workflow.`);
+    if (first) await say(`📅 ${t.month} oyi uchun kontent-reja topilmadi, shuning uchun bugungi draftlar yaratilmadi. Reja yaratish: generate_plan workflow.`);
+    return { done: true, reason: "no plan" };
   }
   if (plan.status !== "active") {
-    return void await say(
-      `⏸ ${t.month} oylik rejasi hali <b>tasdiqlanmagan</b>, shuning uchun bugungi postlar yaratilmadi (ko'r-ko'rona joylamayman). Iltimos, rejani tasdiqlang:`,
-      { reply_markup: planKeyboard(t.month) },
-    );
-  }
-  const { data: items } = await db.from("sv_plan_items").select("*").eq("month", t.month)
-    .eq("post_date", t.iso).eq("status", "planned").neq("post_type", "video_text").order("slot_time");
-  let ok = 0;
-  for (const it of (items ?? []) as PlanItem[]) {
-    const { data: claimed } = await db.from("sv_plan_items").update({ status: "drafting" })
-      .eq("id", it.id).eq("status", "planned").select().maybeSingle();
-    if (!claimed) continue;
-    try {
-      await sendDraft(await generateFromItem(it), { plan_item_id: it.id });
-      ok++;
-    } catch (e) {
-      await db.from("sv_plan_items").update({ status: "planned" }).eq("id", it.id);
-      await say(`⚠️ Reja bandini yasab bo'lmadi (${esc(it.theme ?? "")}): ${esc(errText(e, 250))}`).catch(() => {});
+    if (first) {
+      await say(
+        `⏸ ${t.month} oylik rejasi hali <b>tasdiqlanmagan</b>, shuning uchun bugungi postlar yaratilmadi (ko'r-ko'rona joylamayman). Tasdiqlasangiz, bugungi draftlar darhol yasaladi:`,
+        { reply_markup: planKeyboard(t.month) },
+      );
     }
+    return { done: true, reason: "plan not active" };
   }
-  return ok;
+  let q = db.from("sv_plan_items").select("*").eq("month", t.month)
+    .eq("post_date", t.iso).eq("status", "planned").neq("post_type", "video_text");
+  if (skip.length) q = q.not("id", "in", `(${skip.join(",")})`);
+  const { data: items } = await q.order("slot_time").limit(2);
+  const it = (items ?? [])[0] as PlanItem | undefined;
+  if (!it) return { done: true };
+  const { data: claimed } = await db.from("sv_plan_items").update({ status: "drafting", claimed_at: new Date().toISOString() })
+    .eq("id", it.id).eq("status", "planned").select().maybeSingle();
+  if (!claimed) return { done: false, skipped: it.id };
+  try {
+    const postId = await sendDraft(await generateFromItem(it), { plan_item_id: it.id });
+    return { done: (items ?? []).length < 2, drafted: postId, item: it.id };
+  } catch (e) {
+    await db.from("sv_plan_items").update({ status: "planned", claimed_at: null }).eq("id", it.id);
+    await say(`⚠️ Reja bandini yasab bo'lmadi (${esc(it.theme ?? "")}): ${esc(errText(e, 250))}`).catch(() => {});
+    // a failed item is skipped by the caller's next request, so the others still get their turn
+    return { done: (items ?? []).length < 2, failed: it.id };
+  }
+}
+
+// All of today's items in one go (used after the admin approves the plan mid-day).
+async function runToday() {
+  const skip: number[] = [];
+  for (let i = 0; i < 8; i++) {
+    const r: any = await draftNextToday(i === 0, skip);
+    if (r.failed) skip.push(r.failed);
+    if (r.done) break;
+  }
 }
 
 // ---------- Video support (ffmpeg runs in GitHub Actions) ----------
@@ -1692,6 +1715,10 @@ async function pendingVideos() {
     .eq("post_date", t.iso).eq("post_type", "video_text").eq("status", "planned").order("slot_time").limit(2);
   const out = [];
   for (const it of (items ?? []) as PlanItem[]) {
+    // claim it, so a re-run of the workflow cannot make a second video for the same item
+    const { data: claimed } = await db.from("sv_plan_items").update({ status: "video_making", claimed_at: new Date().toISOString() })
+      .eq("id", it.id).eq("status", "planned").select("id").maybeSingle();
+    if (!claimed) continue;
     try {
       const raw = await gemini(
         `${await header()}\n\nVAZIFA: 20-25 soniyalik brendli vertikal VIDEO (reel) uchun matn. Mavzu: "${it.theme}". Ustun: ${it.pillar}. ` +
@@ -1714,6 +1741,7 @@ async function pendingVideos() {
       });
     } catch (e) {
       console.warn("pendingVideos item failed:", e);
+      await db.from("sv_plan_items").update({ status: "planned", claimed_at: null }).eq("id", it.id);
     }
   }
   return { items: out };
@@ -1736,7 +1764,7 @@ async function registerVideo(b: any) {
   });
   if (error) throw error;
   if (b.plan_item_id) {
-    await db.from("sv_plan_items").update({ status: "draft_sent", post_id: id }).eq("id", b.plan_item_id);
+    await db.from("sv_plan_items").update({ status: "draft_sent", post_id: id, claimed_at: null }).eq("id", b.plan_item_id);
   }
   return { ok: true, id };
 }
@@ -1751,7 +1779,7 @@ async function onVideoChange(cq: any, id: string, kind: "clip" | "music") {
   if (p.status !== "pending") {
     return tg("answerCallbackQuery", { callback_query_id: cq.id, text: "Allaqachon ishlangan" });
   }
-  const media: any = { ...(p.media ?? {}), change: kind };
+  const media: any = { ...(p.media ?? {}), change: kind, attempts: 0 };
   if (kind === "clip") media.clip_rotate = (Number(media.clip_rotate) || 0) + 1;
   await db.from("sv_posts").update({ status: "rebuild", media }).eq("id", id).eq("status", "pending");
   await tg("answerCallbackQuery", {
@@ -1767,7 +1795,7 @@ async function requestVideoTextChange(old: any, note: string) {
   const n = note.toLowerCase();
   const music = /qo['’`ʻ]?shiq|musiqa|ovoz|audio|song|music|kuy/.test(n);
   const clip = /video|klip|tasvir|rasm|surat|foto|fon|background|clip/.test(n);
-  const media: any = { ...(old.media ?? {}) };
+  const media: any = { ...(old.media ?? {}), attempts: 0 };
   if (music && !clip) {
     media.change = "music";
     await db.from("sv_posts").update({ status: "rebuild", media }).eq("id", old.id).eq("status", "pending");
@@ -1782,7 +1810,7 @@ async function requestVideoTextChange(old: any, note: string) {
   // text (or both/unclear): rewrite the script to the note, keep it a video
   await say("✍️ Video matnini izohga ko'ra qayta yozyapman...");
   const spec = await regenVideoText(old, note);
-  Object.assign(media, spec, { change: "text" });
+  Object.assign(media, spec, { change: "text", prev_caption: old.caption });
   await db.from("sv_posts").update({
     status: "rebuild", media, caption: spec.caption_html, sticker_emoji: spec.sticker_emoji ?? old.sticker_emoji,
   }).eq("id", old.id).eq("status", "pending");
@@ -1827,6 +1855,38 @@ async function videoJobs() {
     clip_rotate: p.media?.clip_rotate ?? 0, sticker_emoji: p.sticker_emoji,
   }));
   return { items };
+}
+
+// make_video.py could not rebuild a draft. Retry on the next run, but give up after MAX_REBUILD_ATTEMPTS:
+// the draft goes back to 'pending' with its previous (still valid) video and caption, the admin is told once.
+const MAX_REBUILD_ATTEMPTS = 3;
+async function videoJobFailed(b: any) {
+  const id = String(b?.id ?? "");
+  const { data: p } = await db.from("sv_posts").select("id, media, caption").eq("id", id).eq("status", "rebuild").maybeSingle();
+  if (!p) return { ok: false, error: "not found" };
+  const attempts = (Number(p.media?.attempts) || 0) + 1;
+  const err = String(b?.error ?? "").slice(0, 300);
+  if (attempts < MAX_REBUILD_ATTEMPTS) {
+    await db.from("sv_posts").update({ media: { ...(p.media ?? {}), attempts } }).eq("id", id).eq("status", "rebuild");
+    return { ok: true, attempts, final: false };
+  }
+  const { prev_caption, ...media } = p.media ?? {};
+  await db.from("sv_posts").update({
+    status: "pending", media: { ...media, attempts: 0 }, ...(prev_caption ? { caption: prev_caption } : {}),
+  }).eq("id", id).eq("status", "rebuild");
+  await say(
+    `⚠️ Videoni ${attempts} marta yangilab bo'lmadi, eski variant qoldi (uni tasdiqlash yoki qayta o'zgartirish mumkin).\n` +
+      `Xato: ${esc(err)}`,
+  ).catch(() => {});
+  return { ok: true, attempts, final: true };
+}
+
+// make_video.py could not build a new daily video: free the plan item again.
+async function videoFailed(b: any) {
+  const id = Number(b?.plan_item_id);
+  if (!Number.isInteger(id)) return { ok: false, error: "plan_item_id kerak" };
+  await db.from("sv_plan_items").update({ status: "planned", claimed_at: null }).eq("id", id).eq("status", "video_making");
+  return { ok: true };
 }
 
 // ---------- Metrics: channel reactions ----------
@@ -1982,7 +2042,7 @@ async function onMessage(msg: any) {
   if (cmd === "/reja") {
     const month = tashkent().month;
     const { data: plan } = await db.from("sv_plan").select("status").eq("month", month).maybeSingle();
-    if (!plan) return void await say("Bu oy uchun reja hali yo'q (har oyning 1-kuni avtomatik yaratiladi).");
+    if (!plan) return void await say("Bu oy uchun reja hali yo'q (keyingi oy rejasi har oyning 25-kuni avtomatik yaratiladi).");
     return void await sendPlanView(month, `🗓 ${month} rejasi — holati: <b>${esc(plan.status)}</b>`);
   }
 
@@ -2015,10 +2075,20 @@ async function onMessage(msg: any) {
         return void await withImageLock(old.id, (fresh) => swapImage(fresh, cls.image_query || null));
       }
       await say(cls.scope === "text" ? "✍️ Matnni izohga ko'ra qayta yozyapman..." : "✍️ Matn va rasmni izohga ko'ra qayta yasayapman...");
-      const rewritten = await rewrite(old, text); // on error the old draft stays pending
-      await db.from("sv_posts").update({ status: "replaced" }).eq("id", old.id);
-      return void await sendDraft(rewritten, { plan_item_id: old.plan_item_id });
+      // the old draft is retired only after the new one was really sent: on any error it stays pending
+      const rewritten = await rewrite(old, text);
+      await sendDraft(rewritten, { plan_item_id: old.plan_item_id });
+      const { data: retired } = await db.from("sv_posts").update({ status: "replaced" })
+        .eq("id", old.id).eq("status", "pending").select().maybeSingle();
+      if (retired) await markDraft(retired, "♻️ Yangi variant pastda yuborildi");
+      return;
     }
+  }
+
+  // a forwarded post is handled before any pending free-text answer, otherwise a forgotten
+  // time prompt / plan remark would swallow it ("Vaqtni tushunmadim")
+  if ((msg.forward_origin || msg.forward_from_chat) && (text || msg.photo)) {
+    return void await onForward(msg);
   }
 
   // free-text answers the bot is waiting for (custom time / plan remark)
@@ -2042,10 +2112,6 @@ async function onMessage(msg: any) {
       await say("✍️ Rejani izohga moslab qayta tuzyapman...");
       return void await generatePlan(month, { comment: text, force: true });
     }
-  }
-
-  if ((msg.forward_origin || msg.forward_from_chat) && (text || msg.photo)) {
-    return void await onForward(msg);
   }
 }
 
@@ -2167,12 +2233,32 @@ Deno.serve(async (req) => {
 
   if (has("generate_plan")) {
     const month = url.searchParams.get("month") || tashkent().month;
+    if (!/^\d{4}-\d{2}$/.test(month)) return Response.json({ error: "month: YYYY-MM" }, { status: 400 });
+    if (url.searchParams.get("if_missing") === "1") { // safety net on the 1st: only when no plan exists yet
+      const { data } = await db.from("sv_plan").select("month").eq("month", month).maybeSingle();
+      if (data) return Response.json({ skipped: "plan exists", month });
+    }
     background("Oylik reja", generatePlan(month, { force: url.searchParams.get("force") === "1" }));
     return Response.json({ started: "generate_plan", month });
   }
   if (has("generate_today")) {
     background("Kunlik draftlar", runToday());
     return Response.json({ started: "generate_today", date: tashkent().iso });
+  }
+  // one draft per request (daily.yml loops until done); synchronous so the caller sees the result
+  if (has("generate_next")) {
+    const skip = (url.searchParams.get("skip") ?? "").split(",").map(Number).filter((n) => Number.isInteger(n) && n > 0);
+    try {
+      return Response.json(await draftNextToday(url.searchParams.get("first") === "1", skip));
+    } catch (e) {
+      return Response.json({ done: false, error: String(e).slice(0, 300) }, { status: 500 });
+    }
+  }
+  if (has("video_failed") && req.method === "POST") {
+    return Response.json(await videoFailed(await req.json().catch(() => ({}))));
+  }
+  if (has("video_job_failed") && req.method === "POST") {
+    return Response.json(await videoJobFailed(await req.json().catch(() => ({}))));
   }
   if (has("publish_due")) {
     return Response.json(await publishDue());
